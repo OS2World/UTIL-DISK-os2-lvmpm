@@ -1,3 +1,27 @@
+/*****************************************************************************
+ ** LVMPM - airboot.c                                                       **
+ *****************************************************************************
+ * Routines for working with Air-Boot.                                       *
+ *****************************************************************************
+ *                                                                           *
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *  This program is free software; you can redistribute it and/or modify it  *
+ *  under the terms of the GNU General Public License as published by the    *
+ *  Free Software Foundation; either version 2 of the License, or (at your   *
+ *  option) any later version.                                               *
+ *                                                                           *
+ *  This program is distributed in the hope that it will be useful, but      *
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of               *
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU        *
+ *  General Public License for more details.                                 *
+ *                                                                           *
+ *  You should have received a copy of the GNU General Public License along  *
+ *  with this program; if not, write to the Free Software Foundation, Inc.,  *
+ *  59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                  *
+ *                                                                           *
+ *****************************************************************************/
+
 #include "lvmpm.h"
 
 // ----------------------------------------------------------------------------
@@ -130,6 +154,10 @@ void AirBoot_Install( HWND hwnd )
     // Save any changes still pending
     if ( pGlobal->fsEngine & FS_ENGINE_PENDING ) {
         LvmCommit( &rc );
+        if ( pGlobal->pLog ) {
+            fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
+            fprintf( pGlobal->pLog, "LVM CHANGES COMMITTED: %u\n", rc );
+        }
         if ( rc != LVM_ENGINE_NO_ERROR ) {
             PopupEngineError( NULL, rc, hwnd, pGlobal->hab, pGlobal->hmri );
             return;
@@ -271,6 +299,10 @@ void AirBoot_Delete( HWND hwnd )
                         MB_YESNO | MB_WARNING | MB_MOVEABLE ) == MBID_YES )
     {
         LvmNewMBR( pGlobal->disks[ 0 ].handle, &rc );
+        if ( pGlobal->pLog ) {
+            fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
+            fprintf( pGlobal->pLog, "Writing new MBR to disk: 0\nResult: %u\n", rc );
+        }
         if ( rc != LVM_ENGINE_NO_ERROR )
             PopupEngineError( NULL, rc, hwnd, pGlobal->hab, pGlobal->hmri );
         else {

@@ -1,4 +1,24 @@
+/*****************************************************************************
+ * lvmpm.c                                                                   *
+ *                                                                           *
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *   This program is free software; you can redistribute it and/or modify it *
+ *   under the terms of the GNU General Public License as published by the   *
+ *   Free Software Foundation; either version 2 of the License, or (at your  *
+ *   option) any later version.                                              *
+ *                                                                           *
+ *   This program is distributed in the hope that it will be useful, but     *
+ *   WITHOUT ANY WARRANTY; without even the implied warranty of              *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU       *
+ *   General Public License for more details.                                *
+ *                                                                           *
+ *   You should have received a copy of the GNU General Public License along *
+ *   with this program; if not, write to the Free Software Foundation, Inc., *
+ *   59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                 *
+ *****************************************************************************/
 #include "lvmpm.h"
+
 
 /* ------------------------------------------------------------------------- *
  * main()                                                                    *
@@ -16,11 +36,13 @@ int main( int argc, char *argv[] )
     CHAR      szFile[ CCHMAXPATH+1 ]       = {0},  // NLV filename
               szRes[ STRING_RES_MAXZ ]     = {0},  // string resource buffer
               szError[ STRING_ERROR_MAXZ ] = {0};  // error buffer
-    BOOL      bInitErr = FALSE,                    // initialization failed
-              bLVMOK   = FALSE,                    // LVM engine is open
-              bQuit    = FALSE;                    // program exit confirmed
+    BOOL      bInitErr   = FALSE,                  // initialization failed
+              bLVMOK     = FALSE,                  // LVM engine is open
+              bQuit      = FALSE,                  // program exit confirmed
+              bAppendLog = FALSE;                  // append to rather than replace log
     LONG      lXRes, lYRes,                        // current screen size
-              lX, lY, lW, lH;                      // initial window coordinates
+              lX, lY, lW, lH,                      // initial window coordinates
+              lS;                                  // initial splitbar position
     ULONG     flStyle,                             // window style flags
               i;                                   // loop index for arguments
 
@@ -32,6 +54,9 @@ int main( int argc, char *argv[] )
     for ( i = 1; i < argc; i++ ) {
         if ( strnicmp( argv[ i ], "/log", 4 ) == 0 ) {
             global.fsProgram |= FS_APP_LOGGING;
+        }
+        else if ( strnicmp( argv[ i ], "/keep", 5 ) == 0 ) {
+            bAppendLog = TRUE;
         }
     }
 
@@ -55,7 +80,7 @@ int main( int argc, char *argv[] )
      */
     if ( !bInitErr ) {
         // Get any saved program settings from OS2.INI
-        Settings_Load( &global, &lX, &lY, &lW, &lH );
+        Settings_Load( &global, &lX, &lY, &lW, &lH, &lS );
 
         // Find out if we're running on a DBCS system
         if ( CheckDBCS() ) global.fsProgram |= FS_APP_DBCS;
@@ -206,11 +231,12 @@ int main( int argc, char *argv[] )
         WinSetWindowPtr( hwndClient, 0, &global );
 
         // Set up the main window contents
-        MainWindowInit( hwndClient );
+        MainWindowInit( hwndClient, lS );
 
         // Initialize the log file if logging was requested
-        if ( global.fsProgram & FS_APP_LOGGING )
-            global.pLog = LogFileInit();
+        if ( global.fsProgram & FS_APP_LOGGING ) {
+            global.pLog = LogFileInit( bAppendLog );
+        }
 
         // Open the LVM engine
         if ( LVM_Start( global.pLog, global.hab, global.hmri )) {
@@ -224,7 +250,11 @@ int main( int argc, char *argv[] )
         if ( !bQuit ) {
             // Populate our UI using the data obtained from LVM
             DiskListPopulate( hwndClient );
-            VolumeContainerPopulate( &global );
+            VolumeContainerPopulate( WinWindowFromID( global.hwndVolumes, IDD_VOLUMES ),
+                                     global.volumes, global.ulVolumes,
+                                     global.hab, global.hmri,
+                                     global.fsProgram, FALSE
+                                   );
 
             // Set up the menu-bar
             SetBootMgrActions( &global );
@@ -253,12 +283,14 @@ int main( int argc, char *argv[] )
                 WinDispatchMsg( global.hab, &qmsg );
 
             /* Send a message asking the user to confirm exiting if there were
-             * changes made.  (Granted, it's a bit obnoxious to do this on
-             * WM_QUIT rather than WM_CLOSE, but partitioning is such a critical
-             * operation that it's probably justified in this case.)
+             * changes made, unless ulReturn indicates we've already been told
+             * to reboot or abort. (It's a bit obnoxious to do this on WM_QUIT
+             * rather than WM_CLOSE, but partitioning is such a critical thing
+             * that it's hopefully justified.)
              */
-            if ( (ULONG) WinSendMsg( hwndFrame, WM_COMMAND,
-                                     MPFROM2SHORT( ID_VERIFYQUIT, 0 ), 0 )
+            if (( global.ulReturn == RETURN_NORMAL ) &&
+                (ULONG) WinSendMsg( hwndFrame, WM_COMMAND,
+                                    MPFROM2SHORT( ID_VERIFYQUIT, 0 ), 0 )
                          != MBID_CANCEL )
                 bQuit = TRUE;
 
@@ -304,9 +336,10 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
     PDVMGLOBAL   pGlobal = NULL;            // pointer to global data
     PDISKNOTIFY  pNotify = NULL;            // disk notification message info
     DVCTLDATA    dvdata  = {0};             // disk control data structure
+    PVCTLDATA    pvd     = {0};             // partition control data structure
     WNDPARAMS    wp      = {0};             // used to query window params
+    BOOL         bSelected;                 // is a valid partition selected?
     HWND         hDisk,                     // disk control handle
-                 hPart,                     // partition control handle
                  hwndHelp;                  // program help instance
     CARDINAL32   ulError;                   // LVM error code
     ULONG        ulID,                      // matched pres-param ID
@@ -315,6 +348,7 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
     LONG         lClr;                      // background colour
     USHORT       fsMask;                    // used for various masks
     HPS          hps;                       // presentation space handle
+    POINTL       ptl;                       // mouse pointer position
     RECTL        rcl;                       // drawing rectangle
     BOOLEAN      fSaved;                    // LVM changes committed OK
     CHAR         szRes1[ STRING_RES_MAXZ ], // string resource buffers
@@ -383,12 +417,60 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
 
                 case ID_LVM_NEWMBR:             // Rewrite MBR
-                    System_RewriteMBR( hwnd );
+                    DiskRewriteMBR( hwnd );
+                    break;
+
+
+                case ID_LVM_DISK:
+                    if ( DiskRename( hwnd ))
+                        LVM_Refresh( hwnd );
                     break;
 
 
                 case ID_LVM_REFRESH:            // Refresh
                     LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_LVM_SAVE:               // Save changes
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( pGlobal->fsEngine & FS_ENGINE_PENDING ) {
+                        WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                       IDS_SAVE_CONFIRM, STRING_RES_MAXZ, szRes1 );
+                        WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                       IDS_SAVE_TITLE, STRING_RES_MAXZ, szRes2 );
+                        ulChoice = WinMessageBox( HWND_DESKTOP, hwnd, szRes1, szRes2, 0,
+                                                  MB_YESNO | MB_QUERY | MB_MOVEABLE );
+                        if ( ulChoice == MBID_YES ) {
+                            fSaved = LvmCommit( &ulError );
+                            if ( fSaved ) {
+                                if ( pGlobal->pLog ) {
+                                    fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
+                                    fprintf( pGlobal->pLog, "LVM CHANGES COMMITTED: %u\n", ulError );
+                                }
+                                SetModified( hwnd, FALSE );
+                                // Changes saved; now see if a reboot is needed
+                                if ( LvmRebootRequired() ) {
+                                    WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                                   IDS_REBOOT_NOTIFY, STRING_RES_MAXZ, szRes1 );
+                                    WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                                   IDS_REBOOT_TITLE, STRING_RES_MAXZ, szRes2 );
+                                    WinMessageBox( HWND_DESKTOP, hwnd, szRes1, szRes2,
+                                                   0, MB_OK | MB_WARNING | MB_MOVEABLE  );
+                                    // Set the reboot flag and close the window
+                                    pGlobal->ulReturn = RETURN_REBOOT;
+                                    WinPostMsg( hwnd, WM_QUIT, 0, 0 );
+                                }
+                                else LVM_Refresh( hwnd );
+                            }
+                            else {
+                                // Error during save!  Hope this doesn't happen.
+                                PopupEngineError( NULL, ulError, hwnd,
+                                                  pGlobal->hab, pGlobal->hmri );
+                                pGlobal->ulReturn = ulError;
+                            }
+                        }
+                    }
                     break;
 
 
@@ -399,7 +481,109 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
                 case ID_VOLUME_CREATE:          // Create a volume
                     pGlobal = WinQueryWindowPtr( hwnd, 0 );
-                    VolumeCreate( hwnd, pGlobal );
+                    if ( VolumeCreate( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_VOLUME_DELETE:          // Delete a volume
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( VolumeDelete( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_VOLUME_RENAME:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( VolumeRename( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_VOLUME_LETTER:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( VolumeSetLetter( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_VOLUME_BOOTABLE:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( VolumeMakeBootable( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_VOLUME_STARTABLE:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( VolumeMakeStartable( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_CREATE:       // Create a partition
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    // Make sure free space is selected
+                    bSelected = FALSE;
+                    if ( GetSelectedPartition( pGlobal->hwndDisks, &pvd ) &&
+                        ( pvd.bType == LPV_TYPE_FREE ))
+                    {
+                        bSelected = TRUE;
+                    }
+                    if ( bSelected ) {
+                        if ( PartitionCreate( hwnd, pGlobal, &(pvd.handle), 0 ))
+                            LVM_Refresh( hwnd );
+                    }
+                    else {
+                        WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                       IDS_PARTITION_NOT_FREESPACE, STRING_RES_MAXZ, szRes1 );
+                        WinLoadString( pGlobal->hab, pGlobal->hmri,
+                                       IDS_ERROR_SELECTION, STRING_RES_MAXZ, szRes2 );
+                        WinMessageBox( HWND_DESKTOP, hwnd, szRes1, szRes2,
+                                       0, MB_MOVEABLE | MB_OK | MB_ERROR );
+                    }
+                    break;
+
+
+                case ID_PARTITION_RENAME:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionRename( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_DELETE:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionDelete( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_CONVERT:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionConvertToVolume( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_ADD:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionAddToVolume( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_BOOTABLE:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionMakeBootable( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
+                    break;
+
+
+                case ID_PARTITION_ACTIVE:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if ( PartitionMakeActive( hwnd, pGlobal ))
+                        LVM_Refresh( hwnd );
                     break;
 
 
@@ -455,6 +639,21 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                         // M(i)B terminology preference changed
                         ChangeSizeDisplay( hwnd, pGlobal );
                     }
+
+                    if ( fsMask & FS_APP_UNIFORM ) {
+                        USHORT usCount, i;
+                        HWND hwndDisk;
+                        usCount = (USHORT) WinSendMsg( pGlobal->hwndDisks, LLM_QUERYDISKS, 0, 0 );
+                        for ( i = 0; i < usCount; i++ ) {
+                            hwndDisk = (HWND) WinSendMsg( pGlobal->hwndDisks, LLM_QUERYDISKHWND,
+                                                          MPFROMSHORT( i ), MPFROMSHORT( TRUE ));
+                            if ( hwndDisk )
+                                WinSendMsg( hwndDisk, LDM_SETSTYLE,
+                                            MPFROMSHORT( (pGlobal->fsProgram & FS_APP_UNIFORM)? LDS_FS_UNIFORM: 0 ),
+                                            0 );
+                        }
+                    }
+
                     if ( fsMask & FS_APP_HIDE_FREEPRM ) {
                         // Disk filter changed; empty and repopulate the list
                         DiskListClear( pGlobal );
@@ -464,7 +663,11 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                     if ( fsMask & FS_APP_HIDE_NONLVM ) {
                         // Volume filter changed; empty and repopulate the container
                         VolumeContainerClear( pGlobal );
-                        VolumeContainerPopulate( pGlobal );
+                        VolumeContainerPopulate( WinWindowFromID( pGlobal->hwndVolumes, IDD_VOLUMES ),
+                                                 pGlobal->volumes, pGlobal->ulVolumes,
+                                                 pGlobal->hab, pGlobal->hmri,
+                                                 pGlobal->fsProgram, FALSE
+                                               );
                     }
 
                     if (( fsMask & FS_APP_ENABLE_AB ) ||
@@ -498,6 +701,14 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                     break;
 
 
+                case ID_HELP_TERMS:             // Terminology help
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    if (( hwndHelp = WinQueryHelpInstance( hwnd )) != NULLHANDLE )
+                        WinSendMsg( hwndHelp, HM_DISPLAY_HELP,
+                                    MPFROMSHORT( 2 ), MPFROMSHORT( HM_RESOURCEID ));
+                    break;
+
+
                 case ID_HELP_ABOUT:             // Product information
                     pGlobal = WinQueryWindowPtr( hwnd, 0 );
                     WinDlgBox( HWND_DESKTOP, hwnd, (PFNWP) ProdInfoDlgProc,
@@ -509,7 +720,6 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                     pGlobal = WinQueryWindowPtr( hwnd, 0 );
                     ulChoice = MBID_NO;
 
-/*
                     if (( pGlobal->fsProgram & FS_APP_BOOTWARNING ) &&
                         ( ! CheckBootable( pGlobal )))
                     {
@@ -518,13 +728,13 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                                        IDS_NOBOOT_WARNING, STRING_RES_MAXZ, szRes1 );
                         WinLoadString( pGlobal->hab, pGlobal->hmri,
                                        IDS_NOBOOT_TITLE, STRING_RES_MAXZ, szRes2 );
-                        choice = WinMessageBox( HWND_DESKTOP, hwnd, szRes1, szRes2,
-                                                WARNDLG_NO_BOOTABLE,
-                                                MB_YESNO | MB_WARNING | MB_MOVEABLE );
-                        if ( choice != MBID_YES )
+                        ulChoice = WinMessageBox( HWND_DESKTOP, hwnd, szRes1, szRes2,
+                                                  0,    // TODO should create a help ID and panel for this
+                                                  MB_YESNO | MB_WARNING | MB_MOVEABLE );
+                        if ( ulChoice != MBID_YES )
                             return (MRESULT) MBID_CANCEL;
                     }
-*/
+
                     if ( pGlobal->fsEngine & FS_ENGINE_PENDING ) {
                         WinLoadString( pGlobal->hab, pGlobal->hmri,
                                        IDS_SAVE_QUIT, STRING_RES_MAXZ, szRes1 );
@@ -537,6 +747,10 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                         if ( ulChoice == MBID_YES ) {
                             fSaved = LvmCommit( &ulError );
                             if ( fSaved ) {
+                                if ( pGlobal->pLog ) {
+                                    fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
+                                    fprintf( pGlobal->pLog, "LVM CHANGES COMMITTED: %u\n", ulError );
+                                }
                                 // Changes saved; now see if a reboot is needed
                                 if ( LvmRebootRequired() ) {
                                     WinLoadString( pGlobal->hab, pGlobal->hmri,
@@ -583,17 +797,24 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
                 case LLN_EMPHASIS:
                     pNotify = (PDISKNOTIFY) mp2;
-                    if ( pNotify->hwndPartition ) {
-                        fsMask = (USHORT) WinSendMsg( pNotify->hwndPartition,
-                                                      LPM_GETEMPHASIS, 0, 0 );
-                        if ( fsMask & LPV_FS_SELECTED )
-                            Status_Partition( hwnd, pNotify->hwndPartition );
+                    if ( pNotify->hwndDisk ) {
+                        fsMask = (USHORT) WinSendMsg( pNotify->hwndDisk,
+                                                      LDM_GETEMPHASIS, 0, 0 );
+                        DiskListSelect( hwnd, pNotify->usDisk,
+                                        (BOOL)(fsMask & LDV_FS_SELECTED) );
+                        if ( pNotify->hwndPartition ) {
+                            fsMask = (USHORT) WinSendMsg( pNotify->hwndPartition,
+                                                          LPM_GETEMPHASIS, 0, 0 );
+                            if ( fsMask & LPV_FS_SELECTED ) {
+                                DiskListPartitionSelect( hwnd, pNotify->hwndPartition );
+                            }
+                        }
+                        else Status_Clear( hwnd );
                     }
-                    else Status_Clear( hwnd );
                     return (MRESULT) 0;
 
                 case LLN_KILLFOCUS:         // Disk list lost focus
-                    Status_Clear( hwnd );
+                    Status_Clear( hwnd );   // Clear the status bar
                     return (MRESULT) 0;
 
                 case LLN_SETFOCUS:          // Disk list gained focus
@@ -603,16 +824,35 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                     if ( pGlobal->fsEngine & FS_ENGINE_REFRESH )
                         return (MRESULT) 0;
 
-                    // Get the handle of the currently-selected partition
+                    // Get the handle of the currently-selected disk
                     hDisk = (HWND) WinSendMsg( pGlobal->hwndDisks,
                                                LLM_QUERYDISKEMPHASIS, 0,
                                                MPFROMSHORT( LDV_FS_SELECTED ));
-                    if ( !hDisk ) return (MRESULT) 0;
+                    // Display the selected disk/partition in the status bar
+                    if ( hDisk )
+                        Status_ShowDisk( hwnd, hDisk );
+                    return (MRESULT) 0;
 
-                    hPart = (HWND) WinSendMsg( hDisk, LDM_QUERYPARTITIONEMPHASIS,
-                                               0, MPFROMSHORT( LPV_FS_SELECTED ));
-                    if ( hPart )
-                        Status_Partition( hwnd, hPart );
+                case LLN_CONTEXTMENU:
+                    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+                    pNotify = (PDISKNOTIFY) mp2;
+                    if ( pNotify && pNotify->hwndDisk ) {
+                        if ( pNotify->hwndPartition && pGlobal->hwndPopupPartition ) {
+                            WinSendMsg( pNotify->hwndDisk, LDM_SETEMPHASIS,
+                                        MPFROMP( pNotify->hwndPartition ),
+                                        MPFROM2SHORT( TRUE, LPV_FS_SELECTED | LPV_FS_CONTEXT | LDV_FS_SELECTED ));
+                            WinQueryPointerPos( HWND_DESKTOP, &ptl );
+                            WinPopupMenu( HWND_DESKTOP, hwnd, pGlobal->hwndPopupPartition,
+                                          ptl.x, ptl.y, ID_PARTITION_CREATE,
+                                          PU_HCONSTRAIN | PU_VCONSTRAIN | PU_KEYBOARD | PU_MOUSEBUTTON1 );
+                        }
+                        else {
+                            WinSendMsg( pGlobal->hwndDisks, LLM_SETDISKEMPHASIS,
+                                        MPFROMP( pNotify->hwndDisk ),
+                                        MPFROM2SHORT( TRUE, LDV_FS_SELECTED | LDV_FS_FOCUS ));
+                            // TODO popup disk menu?
+                        }
+                    }
                     return (MRESULT) 0;
 
                 default: break;
@@ -636,6 +876,18 @@ MRESULT EXPENTRY MainWndProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
 
         case WM_HELP:
+            break;
+
+
+        case WM_MENUEND:
+            // Clear any context menu emphasis on disk
+            pGlobal = WinQueryWindowPtr( hwnd, 0 );
+            hDisk = (HWND) WinSendMsg( pGlobal->hwndDisks,
+                                       LLM_QUERYDISKEMPHASIS, 0,
+                                       MPFROMSHORT( LDV_FS_SELECTED ));
+            if ( hDisk )
+                WinSendMsg( hDisk, LDM_SETEMPHASIS, MPVOID,
+                            MPFROM2SHORT( FALSE, LPV_FS_CONTEXT | LDV_FS_CONTEXT ));
             break;
 
 
@@ -788,13 +1040,15 @@ void MainWindowCleanup( HWND hwnd )
  * Creates and configures the main window contents.                          *
  *                                                                           *
  * ARGUMENTS:                                                                *
- *   HWND hwnd: handle of the program client window                          *
+ *   HWND   hwnd: handle of the program client window                        *
+ *   LONG   lSB : split-bar position                                         *
  *                                                                           *
  * RETURNS: N/A                                                              *
  * ------------------------------------------------------------------------- */
-void MainWindowInit( HWND hwnd )
+void MainWindowInit( HWND hwnd, LONG lSB )
 {
     PDVMGLOBAL    pGlobal;
+    HMODULE       hIconLib;
     SPLITBARCDATA sbdata = {0};
     CHAR          szRes[ STRING_RES_MAXZ ];
     LONG          lClr;
@@ -846,12 +1100,16 @@ void MainWindowInit( HWND hwnd )
                                             pGlobal->hmri, IDP_VOL_BASIC );
     pGlobal->hptrAdvanced = WinLoadPointer( HWND_DESKTOP,
                                             pGlobal->hmri, IDP_VOL_ADVANCED );
-    pGlobal->hptrCD       = WinLoadPointer( HWND_DESKTOP,
-                                            pGlobal->hmri, IDP_VOL_CDROM );
-    pGlobal->hptrLAN      = WinLoadPointer( HWND_DESKTOP,
-                                            pGlobal->hmri, IDP_VOL_NETWORK  );
     pGlobal->hptrUnknown  = WinLoadPointer( HWND_DESKTOP,
                                             pGlobal->hmri, IDP_VOL_UNKNOWN  );
+    if ( DosQueryModuleHandle("PMWP.DLL", &hIconLib ) == NO_ERROR ) {
+        pGlobal->hptrCD  = WinLoadPointer( HWND_DESKTOP, hIconLib, 19 );
+        pGlobal->hptrLAN = WinLoadPointer( HWND_DESKTOP, hIconLib, 16 );
+    }
+    else {
+        pGlobal->hptrCD  = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_VOL_CDROM );
+        pGlobal->hptrLAN = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_VOL_NETWORK );
+    }
 
     pGlobal->hwndDisks = WinCreateWindow( hwnd, WC_LVMDISKS, "", WS_VISIBLE |
                                           WS_CLIPCHILDREN | CS_SIZEREDRAW,
@@ -866,7 +1124,7 @@ void MainWindowInit( HWND hwnd )
     sbdata.ulSplitWindowID     = IDD_SPLIT_WINDOW;
     sbdata.ulCreateFlags       = SBCF_HORIZONTAL | SBCF_PERCENTAGE |
                                  SBCF_3DSUNK | SBCF_MOVEABLE;
-    sbdata.lPos                = 50;
+    sbdata.lPos                = lSB? lSB: 40;
     sbdata.ulLeftOrBottomLimit = 0;
     sbdata.ulRightOrTopLimit   = 0;
     sbdata.hwndParentAndOwner  = hwnd;
@@ -875,7 +1133,9 @@ void MainWindowInit( HWND hwnd )
                 MPFROMP( pGlobal->hwndDisks ), MPFROMP( pGlobal->hwndVolumes ));
 
     // Create the context menus
-    //global->hwndPopupDisk = WinLoadMenu( HWND_DESKTOP, pGlobal->hmri, IDM_DISKPOPUP );
+    //pGlobal->hwndPopupDisk = WinLoadMenu( HWND_DESKTOP, pGlobal->hmri, IDM_CONTEXT_DISK );
+    pGlobal->hwndPopupPartition = WinLoadMenu( HWND_DESKTOP, pGlobal->hmri, IDM_CONTEXT_PARTITION );
+    pGlobal->hwndPopupVolume = WinLoadMenu( HWND_DESKTOP, pGlobal->hmri, IDM_CONTEXT_VOLUME );
 
     // Create the tooltip control used by the disk list
     pGlobal->hwndTT = WinCreateWindow( HWND_DESKTOP, COMCTL_TOOLTIP_CLASS, NULL,
@@ -1117,27 +1377,84 @@ void MainWindowFocus( HWND hwnd, BOOL fNext )
  * ------------------------------------------------------------------------- */
 void PopupEngineError( PSZ pszMessage, CARDINAL32 code, HWND hwnd, HAB hab, HMODULE hmri )
 {
-    CHAR  szRes[ STRING_RES_MAXZ ];
-    PSZ   pszTitle;
-    ULONG cch,
-          ulStyle;
+    CHAR   szRes[ STRING_RES_MAXZ ],
+           szRes2[ STRING_RES_MAXZ + 12 ];
+    PSZ    pszTitle;
+    ULONG  cch,
+           ulStyle;
+    USHORT usID;
 
     cch = WinLoadString( hab, hmri, IDS_ERROR_ENGINE, STRING_RES_MAXZ, szRes );
     pszTitle = (PSZ) malloc( cch + 4 );
     if ( pszTitle )
         sprintf( pszTitle, szRes, code );
 
+    if (( code & 0xFF00 ) == LVM_ERROR_INCOMPATIBLE_PARTITIONING )
+        usID = IDD_ENGINE_ERROR_INCOMPATIBLE;
+    else
+        usID = IDD_ENGINE_ERROR + code;
+
     if ( !pszMessage ) {
-        WinLoadString( hab, hmri, IDS_ERROR_LVM + code, STRING_RES_MAXZ, szRes );
-        pszMessage = szRes;
+        if (( code & 0xFF00 ) == LVM_ERROR_INCOMPATIBLE_PARTITIONING ) {
+            WinLoadString( hab, hmri, IDS_ERROR_LVM_INCOMPATIBLE, STRING_RES_MAXZ, szRes );
+            sprintf( szRes2, szRes, (code & 0xFF)+1 );
+            pszMessage = szRes2;
+        }
+        else {
+            WinLoadString( hab, hmri, IDS_ERROR_LVM + code, STRING_RES_MAXZ, szRes );
+            pszMessage = szRes;
+        }
     }
 
     ulStyle = MB_MOVEABLE | MB_APPLMODAL | MB_OK | MB_HELP | MB_ERROR;
     WinMessageBox( HWND_DESKTOP, hwnd, pszMessage,
-                   ( pszTitle ? pszTitle : SZ_ERROR_GENERIC ),
-                   IDD_ENGINE_ERROR + code, ulStyle );
+                   pszTitle? pszTitle: SZ_ERROR_GENERIC, usID, ulStyle );
 
-    if ( pszTitle ) free( pszTitle );
+    if ( pszTitle ) free ( pszTitle );
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * CheckBootable()                                                           *
+ *                                                                           *
+ * See if there are any bootable volumes defined.  A bootable volume is one  *
+ * that meets all of the following criteria:                                 *
+ *   - Must have a fixed drive letter                                        *
+ *   - If Air-Boot is installed: must simply be a compatibility volume.      *
+ *     Otherwise: must have either the LVM bootable/startable flag set.      *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *     PDVMGLOBAL pGlobal: Pointer to global program data                    *
+ *                                                                           *
+ * RETURNS: BOOL                                                             *
+ *   FALSE if there are no bootable volumes found.                           *
+ * ------------------------------------------------------------------------- */
+BOOL CheckBootable( PDVMGLOBAL pGlobal )
+{
+    PLVMVOLUMEINFO pVol;
+    ULONG          i;
+    BOOL           fBootable;
+
+    if ( !pGlobal || !pGlobal->ulVolumes || ! pGlobal->volumes )
+        return FALSE;
+
+    // Look through all volumes until we find one which meets the criteria.
+    fBootable = FALSE;
+    for ( i = 0; !fBootable && ( i < pGlobal->ulVolumes ); i++ ) {
+        pVol = (PLVMVOLUMEINFO)(pGlobal->volumes + i);
+        if ( !pVol->cPreference ||
+             !( pVol->cPreference >= 'C') && (pVol->cPreference <= 'Z'))
+            continue;       // no permanent drive letter, so skip
+
+        // OK, it has a valid drive letter.  Now check the bootable status.
+        if (( pGlobal->fsEngine & FS_ENGINE_AIRBOOT ) && pVol->fCompatibility )
+            // Air-Boot will accept any compatibility volume
+            fBootable = TRUE;
+        else if (( pVol->iStatus > 0 ) && ( pVol->iStatus < 3 ))
+            // Otherwise check the volume's status field
+            fBootable = TRUE;
+    }
+    return fBootable;
 }
 
 
@@ -1186,6 +1503,10 @@ MRESULT EXPENTRY PrefsDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                 WinCheckButton( hwnd, IDD_PREFS_NO_EMPTY_DISKS, 1 );
             if ( pGlobal->fsProgram & FS_APP_HIDE_NONLVM )
                 WinCheckButton( hwnd, IDD_PREFS_NO_ALIEN_VOLUMES, 1 );
+            if ( pGlobal->fsProgram & FS_APP_UNIFORM )
+                WinCheckButton( hwnd, IDD_PREFS_UNIFORM, 1 );
+            if ( pGlobal->fsProgram & FS_APP_AUTOSELECT )
+                WinCheckButton( hwnd, IDD_PREFS_AUTOSELECT, 1 );
 
             if ( pGlobal->fsProgram & FS_APP_PMSTYLE )
                 usCtl = IDD_PREFS_STYLE_PM;
@@ -1223,6 +1544,16 @@ MRESULT EXPENTRY PrefsDlgProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                         pGlobal->fsProgram |= FS_APP_BOOTWARNING;
                     else
                         pGlobal->fsProgram &= ~FS_APP_BOOTWARNING;
+
+                    if ( WinQueryButtonCheckstate( hwnd, IDD_PREFS_UNIFORM ))
+                        pGlobal->fsProgram |= FS_APP_UNIFORM;
+                    else
+                        pGlobal->fsProgram &= ~FS_APP_UNIFORM;
+
+                    if ( WinQueryButtonCheckstate( hwnd, IDD_PREFS_AUTOSELECT ))
+                        pGlobal->fsProgram |= FS_APP_AUTOSELECT;
+                    else
+                        pGlobal->fsProgram &= ~FS_APP_AUTOSELECT;
 
                     if ( WinQueryButtonCheckstate( hwnd, IDD_PREFS_NO_EMPTY_DISKS ))
                         pGlobal->fsProgram |= FS_APP_HIDE_FREEPRM;
@@ -1608,6 +1939,7 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     VICTLDATA             infodata = {0};  // control data for info panel
 
     PNOTIFYRECORDEMPHASIS pNotify;
+    PMINIRECORDCORE       pRec;
 
     HWND   hwndOwner;
     HPS    hps;
@@ -1667,9 +1999,11 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                                               0, 0, 0, 0, hwnd, HWND_TOP,
                                               IDD_VOL_INFO, &infodata, NULL );
 
+            pGlobal->hwndPopupVolume;
 
             WinSetWindowPtr( hwnd, 0, pCtl );
             return (MRESULT) FALSE;
+            // End WM_CREATE
 
 
         case WM_DESTROY:
@@ -1680,11 +2014,19 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
             break;
 
 
+        case WM_COMMAND:
+            // Pass these up to the main window
+            hwndOwner = WinQueryWindow( hwnd, QW_OWNER );
+            WinPostMsg( hwndOwner, msg, mp1, mp2 );
+            return (MRESULT) 0;
+
+
         case WM_CONTROL:
             switch( SHORT1FROMMP( mp1 )) {
 
                 case IDD_VOLUMES:
                     hwndOwner = WinQueryWindow( hwnd, QW_OWNER );
+                    pCtl = WinQueryWindowPtr( hwnd, 0 );
 
                     switch( SHORT2FROMMP( mp1 )) {
 
@@ -1694,8 +2036,8 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                             if (( pNotify->fEmphasisMask & CRA_SELECTED ) &&
                                 ( pNotify->pRecord->flRecordAttr & CRA_SELECTED ))
                             {
-                                VolumeContainerSelect( hwndOwner,
-                                    (PDVMVOLUMERECORD) (pNotify->pRecord) );
+                                VolumeContainerSelect( hwndOwner, pGlobal->hwndPopupVolume,
+                                                       (PDVMVOLUMERECORD) (pNotify->pRecord) );
                                 //Status_Volume( hwndOwner, (PDVMVOLUMERECORD) (pNotify->pRecord) );
                             }
                             break;
@@ -1710,6 +2052,25 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
                             // set the status bar for the selected record
                             break;
 
+                        case CN_CONTEXTMENU:
+                             // If a record was clicked on, select it
+                            pRec = (PMINIRECORDCORE) mp2;
+                            if ( pRec == NULL )
+                                // Otherwise, keep the previous selection
+                                pRec = WinSendDlgItemMsg( hwnd, IDD_VOLUMES, CM_QUERYRECORDEMPHASIS,
+                                                          MPFROMP( CMA_FIRST ), MPFROMSHORT( CRA_SELECTED ));
+                            if ( pRec )
+                                WinSendDlgItemMsg( hwnd, IDD_VOLUMES, CM_SETRECORDEMPHASIS, MPFROMP( pRec ),
+                                                   MPFROM2SHORT( MPFROMSHORT( TRUE ),
+                                                                 MPFROMSHORT( CRA_CURSORED | CRA_SELECTED )));
+
+                            // Open the popup menu under the mouse
+                            if ( pGlobal->hwndPopupVolume ) {
+                                WinQueryPointerPos( HWND_DESKTOP, &ptl );
+                                WinPopupMenu( HWND_DESKTOP, hwnd, pGlobal->hwndPopupVolume, ptl.x, ptl.y, ID_VOLUME_CREATE,
+                                              PU_HCONSTRAIN | PU_VCONSTRAIN | PU_KEYBOARD | PU_MOUSEBUTTON1 );
+                            }
+                            break;
 
                     }
                     break;
@@ -1841,27 +2202,6 @@ MRESULT EXPENTRY VolumesPanelProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 
     }
 
     return WinDefWindowProc( hwnd, msg, mp1, mp2 );
-}
-
-
-/* ------------------------------------------------------------------------- *
- * ------------------------------------------------------------------------- */
-FILE * LogFileInit( void )
-{
-    FILE *pLog;                     // log file handle
-    PSZ   pszLogPath,               // path to store log file
-          pszLogFile;               // filespec of log file
-
-    if ( DosScanEnv( LOG_PATH, &pszLogPath ) == NO_ERROR ) {
-        pszLogFile = (PSZ) malloc( strlen( pszLogPath ) +
-                                   strlen( LOG_FILE ) + 2 );
-        sprintf( pszLogFile, "%s\\%s", pszLogPath, LOG_FILE );
-        pLog = fopen( pszLogFile, "w");
-        free( pszLogFile );
-    }
-    else pLog = fopen( LOG_FILE, "w");
-
-    return ( pLog );
 }
 
 
@@ -2118,12 +2458,8 @@ void PartitionContainerClear( HWND hwndCnr, PDVMGLOBAL pGlobal )
 void VolumeContainerSetup( PDVMGLOBAL pGlobal )
 {
     CNRINFO         cnrinfo = {0};              // container setup structure
-    FIELDINFOINSERT finsert = {0};              // field-insertion structure
-    PFIELDINFO      fi,                         // pointer to current field info
-                    fiAll;                      // pointer to first field info
     HWND            hwndCnr;                    // handle of container
     CHAR            szRes[ STRING_RES_MAXZ ];   // string resource buffer
-    LONG            cch;
 
 
     if ( !pGlobal ) return;
@@ -2133,7 +2469,7 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     cnrinfo.pszCnrTitle = NULL;
 #if 1
     if ( WinLoadString( pGlobal->hab, pGlobal->hmri,
-                         IDS_LABELS_VOLUMES, STRING_RES_MAXZ, szRes ) > 0 ) {
+                        IDS_LABELS_VOLUMES, STRING_RES_MAXZ, szRes ) > 0 ) {
         cnrinfo.flWindowAttr |= CA_CONTAINERTITLE | CA_TITLEREADONLY |
                                 CA_TITLESEPARATOR;
         cnrinfo.pszCnrTitle = strdup( szRes );
@@ -2142,6 +2478,33 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     cnrinfo.cyLineSpacing = 4;
     WinSendMsg( hwndCnr, CM_SETCNRINFO, MPFROMP( &cnrinfo ),
                 MPFROMLONG( CMA_FLWINDOWATTR | CMA_LINESPACING | CMA_CNRTITLE ));
+
+    VolumeContainerSetupDetails( hwndCnr, pGlobal->hab, pGlobal->hmri, pGlobal->fsProgram );
+
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * VolumeContainerSetup()                                                    *
+ *                                                                           *
+ * This function initializes the volumes list container, defining its        *
+ * appearance and setting the fields for detail view.                        *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND    hwndCnr  : Handle of container control                          *
+ *   HAB     hab      : Anchor block handle                                  *
+ *   HMODULE hmri     : Handle of language resource module                   *
+ *   USHORT  fsProgram: Program preference flags                             *
+ *                                                                           *
+ * RETURNS: N/A                                                              *
+ * ------------------------------------------------------------------------- */
+void VolumeContainerSetupDetails( HWND hwndCnr, HAB hab, HMODULE hmri, USHORT fsProgram )
+{
+    FIELDINFOINSERT finsert = {0};              // field-insertion structure
+    PFIELDINFO      fi,                         // pointer to current field info
+                    fiAll;                      // pointer to first field info
+    CHAR            szRes[ STRING_RES_MAXZ ];   // string resource buffer
+    LONG            cch;
 
     // Create the detail view fields
     fiAll = (PFIELDINFO) WinSendMsg( hwndCnr, CM_ALLOCDETAILFIELDINFO,
@@ -2159,7 +2522,7 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     fi = fi->pNextFieldInfo;
 
     // Volume name column
-    cch = WinLoadString( pGlobal->hab, pGlobal->hmri,
+    cch = WinLoadString( hab, hmri,
                          IDS_FIELD_VOLUME_NAME, STRING_RES_MAXZ, szRes );
     if ( cch && (( fi->pTitleData = (PSZ) calloc( 1, cch + 1 )) != NULL ))
         strncpy( fi->pTitleData, szRes, cch );
@@ -2170,10 +2533,10 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     fi = fi->pNextFieldInfo;
 
     // Size column
-    cch = WinLoadString( pGlobal->hab, pGlobal->hmri,
+    cch = WinLoadString( hab, hmri,
                          IDS_FIELD_SIZE, STRING_RES_MAXZ, szRes );
     if ( cch && (( fi->pTitleData = (PSZ) calloc( 1, cch + 2 )) != NULL )) {
-        if ( pGlobal->fsProgram & FS_APP_IECSIZES )
+        if ( fsProgram & FS_APP_IECSIZES )
             sprintf( fi->pTitleData, szRes, "MiB");
         else
             sprintf( fi->pTitleData, szRes, "MB");
@@ -2185,7 +2548,7 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     fi = fi->pNextFieldInfo;
 
     // Filesystem column
-    cch = WinLoadString( pGlobal->hab, pGlobal->hmri,
+    cch = WinLoadString( hab, hmri,
                          IDS_FIELD_FILESYSTEM, STRING_RES_MAXZ, szRes );
     if ( cch && (( fi->pTitleData = (PSZ) calloc( 1, cch + 1 )) != NULL ))
         strncpy( fi->pTitleData, szRes, cch );
@@ -2196,7 +2559,7 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     fi = fi->pNextFieldInfo;
 
     // Volume type column
-    cch = WinLoadString( pGlobal->hab, pGlobal->hmri,
+    cch = WinLoadString( hab, hmri,
                          IDS_FIELD_VOLUME_TYPE, STRING_RES_MAXZ, szRes );
     if ( cch && (( fi->pTitleData = (PSZ) calloc( 1, cch + 1 )) != NULL ))
         strncpy( fi->pTitleData, szRes, cch );
@@ -2207,7 +2570,7 @@ void VolumeContainerSetup( PDVMGLOBAL pGlobal )
     fi = fi->pNextFieldInfo;
 
     // Flags column
-    cch = WinLoadString( pGlobal->hab, pGlobal->hmri,
+    cch = WinLoadString( hab, hmri,
                          IDS_FIELD_FLAGS, STRING_RES_MAXZ, szRes );
     if ( cch && (( fi->pTitleData = (PSZ) calloc( 1, cch + 1 )) != NULL ))
         strncpy( fi->pTitleData, szRes, cch );
@@ -2281,6 +2644,7 @@ void DiskListPopulate( HWND hwnd )
     PPVCTLDATA      pPartCtl;       // Array of partition control data structures
     HWND            hwndDisk,       // Handle of disk control
                     hwndPart;       // Handle of partition control
+    HMODULE         hIconLib;       // Handle of DLL containing icon resources
     HPOINTER        hicon,          // Pointer to current icon
                     hptrHDD,        // Icon for normal hard disks
                     hptrPRM,        // Icon for normal PRM disks
@@ -2341,10 +2705,17 @@ void DiskListPopulate( HWND hwnd )
                 MPFROMLONG( ulCount ), MPFROMP( pDiskCtl ));
 
     // Now set the info for each disk
-
-    hptrHDD     = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_HDD );
-    hptrPRM     = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_PRM );
-    hptrEmpty   = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_PRM_MISSING );
+    rc = (APIRET) DosQueryModuleHandle("PMWP.DLL", &hIconLib );
+    if ( rc == NO_ERROR ) {
+        hptrHDD     = WinLoadPointer( HWND_DESKTOP, hIconLib, 13 );
+        hptrPRM     = WinLoadPointer( HWND_DESKTOP, hIconLib, 95 );
+        hptrEmpty   = WinLoadPointer( HWND_DESKTOP, hIconLib, 76 );
+    }
+    else {
+        hptrHDD     = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_HDD );
+        hptrPRM     = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_PRM );
+        hptrEmpty   = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_PRM_MISSING );
+    }
     hptrMemdisk = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_MEMDISK );
     hptrBad     = WinLoadPointer( HWND_DESKTOP, pGlobal->hmri, IDP_DISK_BAD );
 
@@ -2371,6 +2742,11 @@ void DiskListPopulate( HWND hwnd )
             hicon = ( pGlobal->disks[ i ].fPRM ) ? hptrPRM : hptrHDD;
         WinSendMsg( hwndDisk, LDM_SETDISKICON, MPFROMP(hicon), 0 );
 
+        // Set the disk style
+        WinSendMsg( hwndDisk, LDM_SETSTYLE,
+                    MPFROMSHORT( (pGlobal->fsProgram & FS_APP_UNIFORM)? LDS_FS_UNIFORM: 0 ),
+                    0 );
+
         if ( pGlobal->disks[ i ].fUnusable ) continue;
 
         // Set the partitions for the disk
@@ -2391,6 +2767,7 @@ void DiskListPopulate( HWND hwnd )
             else
                 pPartCtl[ j ].bType = partitions.Partition_Array[ j ].Primary_Partition ?
                                       LPV_TYPE_PRIMARY : LPV_TYPE_LOGICAL;
+            pPartCtl[ j ].fInUse  = (BOOL)( partitions.Partition_Array[ j ].Partition_Status == PARTITION_IS_IN_USE );
             pPartCtl[ j ].bOS     = partitions.Partition_Array[ j ].OS_Flag;
             pPartCtl[ j ].ulSize  = SECS_TO_MiB( partitions.Partition_Array[ j ].Usable_Partition_Size );
             pPartCtl[ j ].number  = j + 1;
@@ -2399,14 +2776,25 @@ void DiskListPopulate( HWND hwnd )
             strncpy( pPartCtl[ j ].szName,
                      partitions.Partition_Array[ j ].Partition_Name,
                      PARTITION_NAME_SIZE );
+            strncpy( pPartCtl[ j ].szFS,
+                     partitions.Partition_Array[ j ].File_System_Name,
+                     FILESYSTEM_NAME_SIZE );
 
             // Get the actual (not configured) drive letter
+            pPartCtl[ j ].cLetter = '\0';
             if ( partitions.Partition_Array[ j ].Volume_Handle ) {
                 volume = LvmGetVolumeInfo( partitions.Partition_Array[ j ].Volume_Handle, &rc );
-                pPartCtl[ j ].cLetter = rc ? '\0' : volume.Current_Drive_Letter;
+                if ( rc == LVM_ENGINE_NO_ERROR ) {
+                    if ( !volume.Current_Drive_Letter ) {
+                        // No current drive letter, see if there's a newly-assigned one
+                        if ( volume.Drive_Letter_Preference )
+                            pPartCtl[ j ].cLetter = volume.Drive_Letter_Preference;
+                    }
+                    else
+                        pPartCtl[ j ].cLetter = volume.Current_Drive_Letter;
+                }
             }
-            else
-                pPartCtl[ j ].cLetter = '\0';
+
         }
         WinSendMsg( hwndDisk, LDM_SETPARTITIONS,
                     MPFROMLONG( partitions.Count ), MPFROMP( pPartCtl ));
@@ -2480,11 +2868,17 @@ void DiskListPopulate( HWND hwnd )
  * data.                                                                     *
  *                                                                           *
  * ARGUMENTS:                                                                *
- *   PDVMGLOBAL pGlobal: Application global data                             *
+ *   HWND           hwndCnr  : Handle of container control                   *
+ *   PLVMVOLUMEINFO volumes  : Array of volume information structures        *
+ *   CARDINAL32     ulVolumes: Number of items in 'volumes'                  *
+ *   HAB            hab      : Global HAB                                    *
+ *   HMODULE        hmri     : Handle to MRI resource module                 *
+ *   USHORT         fsProgram: Global program flags                          *
+ *   BOOL           fLVM     : Show only LVM (advanced) volumes?             *
  *                                                                           *
  * RETURNS: N/A                                                              *
  * ------------------------------------------------------------------------- */
-void VolumeContainerPopulate( PDVMGLOBAL pGlobal )
+void VolumeContainerPopulate( HWND hwndCnr, PLVMVOLUMEINFO volumes, CARDINAL32 ulVolumes, HAB hab, HMODULE hmri, USHORT fsProgram, BOOL fLVM )
 {
     PDVMVOLUMERECORD pRecAll,       // List of container records
                      pRec;          // Current container record
@@ -2495,107 +2889,112 @@ void VolumeContainerPopulate( PDVMGLOBAL pGlobal )
     CHAR             szRes[ STRING_RES_MAXZ ] = {0};  // String resource buffer
 
 
-    if ( !pGlobal || !pGlobal->ulVolumes ) return;
+    if ( !volumes || !ulVolumes ) return;
 
-    if ( pGlobal->fsProgram & FS_APP_HIDE_NONLVM ) {
-        for ( i = 0, ulCount = 0; i < pGlobal->ulVolumes; i++ ) {
-            if ( pGlobal->volumes[ i ].bDevice <= LVM_DEVICE_PRM )
+    if ( fLVM ) {
+        for ( i = 0, ulCount = 0; i < ulVolumes; i++ ) {
+            if ( !volumes[ i ].fCompatibility )
                 ulCount++;
         }
     }
-    else ulCount = pGlobal->ulVolumes;
+    else
+
+    if ( fsProgram & FS_APP_HIDE_NONLVM ) {
+        for ( i = 0, ulCount = 0; i < ulVolumes; i++ ) {
+            if ( volumes[ i ].bDevice <= LVM_DEVICE_PRM )
+                ulCount++;
+        }
+    }
+    else ulCount = ulVolumes;
+
+    if ( !ulCount ) return;
 
     // Allocate the memory for records
     cb = sizeof( DVMVOLUMERECORD ) - sizeof( MINIRECORDCORE );
-    pRecAll = (PDVMVOLUMERECORD) \
-              WinSendDlgItemMsg( pGlobal->hwndVolumes, IDD_VOLUMES,
-                                 CM_ALLOCRECORD, MPFROMLONG( cb ),
-                                 MPFROMLONG( ulCount ));
+    pRecAll = (PDVMVOLUMERECORD) WinSendMsg( hwndCnr, CM_ALLOCRECORD,
+                                             MPFROMLONG( cb ), MPFROMLONG( ulCount ));
 
     // Populate the record data structures
 
     pRec = pRecAll;
-    for ( i = 0; i < pGlobal->ulVolumes; i++ ) {
+    for ( i = 0; i < ulVolumes; i++ ) {
+        // Skip over non-advanced volumes if requested by the caller
+        if ( fLVM && volumes[ i ].fCompatibility ) continue;
 
-        // Skip over non-LVM volumes if the user doesn't want to see them
-        if (( pGlobal->fsProgram & FS_APP_HIDE_NONLVM ) &&
-            ( pGlobal->volumes[ i ].bDevice > LVM_DEVICE_PRM ))
+        // Skip over non-managed volumes if the user doesn't want to see them
+        if (( fsProgram & FS_APP_HIDE_NONLVM ) &&
+            ( volumes[ i ].bDevice > LVM_DEVICE_PRM ))
             continue;
 
-        pRec->record.pszIcon  = strdup( pGlobal->volumes[ i ].szName );
+        pRec->record.pszIcon  = strdup( volumes[ i ].szName );
         pRec->record.hptrIcon = NULLHANDLE;
         pRec->record.cb       = sizeof( MINIRECORDCORE );
 
-        pRec->handle    = pGlobal->volumes[ i ].handle;
+        pRec->handle    = volumes[ i ].handle;
         pRec->ulVolume  = i;
-        pRec->ulSize    = pGlobal->volumes[ i ].iSize;
+        pRec->ulSize    = volumes[ i ].iSize;
         pRec->pszName   = pRec->record.pszIcon;
-        pRec->pszFS     = strdup( pGlobal->volumes[ i ].szFS );
+        pRec->pszFS     = strdup( volumes[ i ].szFS );
 
         // Volume type field
-        if ( pGlobal->volumes[ i ].fCompatibility ) {
-            WinLoadString( pGlobal->hab, pGlobal->hmri,
-                           ( pGlobal->fsProgram & FS_APP_IBMTERMS ) ?
+        if ( volumes[ i ].fCompatibility ) {
+            WinLoadString( hab, hmri,
+                           ( fsProgram & FS_APP_IBMTERMS ) ?
                            IDS_TERMS_COMPATIBILITY : IDS_TERMS_STANDARD,
                            STRING_RES_MAXZ, szRes );
         }
         else {
-            WinLoadString( pGlobal->hab, pGlobal->hmri,
-                           ( pGlobal->fsProgram & FS_APP_IBMTERMS ) ?
+            WinLoadString( hab, hmri,
+                           ( fsProgram & FS_APP_IBMTERMS ) ?
                            IDS_TERMS_LVM : IDS_TERMS_ADVANCED,
                            STRING_RES_MAXZ, szRes );
         }
         pRec->pszType = strdup( szRes );
 
         // Drive letter field
-        if ( !pGlobal->volumes[ i ].cLetter ) {
-
+        if ( !volumes[ i ].cLetter ) {
             // Current drive letter is null, could be for a couple of reasons...
 
-            if ( !pGlobal->volumes[ i ].cPreference ) {
+            if ( !volumes[ i ].cPreference ) {
                 // No drive letter assigned
-
                 pRec->pszLetter = strdup(" ");
             }
             else {
                 // Drive letter changed during this session
-
-                WinLoadString( pGlobal->hab, pGlobal->hmri,
+                WinLoadString( hab, hmri,
                                IDS_LETTER_CHANGED, STRING_RES_MAXZ, szRes );
                 pRec->pszLetter = (PSZ) malloc( strlen( szRes ) + 1 );
                 sprintf( pRec->pszLetter, szRes,
-                         pGlobal->volumes[ i ].cInitial ?
-                             pGlobal->volumes[ i ].cInitial : '*',
-                         pGlobal->volumes[ i ].cPreference );
+                         volumes[ i ].cInitial ?
+                             volumes[ i ].cInitial : '*',
+                         volumes[ i ].cPreference );
             }
 
         }
         else {
             // See if the current drive letter is the same as the configured one
 
-            if ( pGlobal->volumes[ i ].cPreference &&
-                 ( pGlobal->volumes[ i ].cPreference != pGlobal->volumes[ i ].cLetter ))
+            if ( volumes[ i ].cPreference &&
+                 ( volumes[ i ].cPreference != volumes[ i ].cLetter ))
             {
                 // Volume did not get its preferred drive letter at boot
-
-                WinLoadString( pGlobal->hab, pGlobal->hmri,
+                WinLoadString( hab, hmri,
                                IDS_LETTER_CHANGED, STRING_RES_MAXZ, szRes );
                 pRec->pszLetter = (PSZ) malloc( strlen( szRes ) + 1 );
                 sprintf( pRec->pszLetter, szRes,
-                         pGlobal->volumes[ i ].cPreference,
-                         pGlobal->volumes[ i ].cLetter );
+                         volumes[ i ].cPreference,
+                         volumes[ i ].cLetter );
             } else {
                 // Drive has had its preferred letter since bootup
-
                 pRec->pszLetter = (PSZ) malloc( 3 );
-                sprintf( pRec->pszLetter, "%c:", pGlobal->volumes[ i ].cLetter );
+                sprintf( pRec->pszLetter, "%c:", volumes[ i ].cLetter );
             }
 
         }
 
         // Flags field
-        if ( pGlobal->volumes[ i ].fCompatibility ) {
-            switch ( pGlobal->volumes[ i ].iStatus ) {
+        if ( volumes[ i ].fCompatibility ) {
+            switch ( volumes[ i ].iStatus ) {
 
                 default:
                 case LVM_VOLUME_STATUS_NONE:
@@ -2603,26 +3002,26 @@ void VolumeContainerPopulate( PDVMGLOBAL pGlobal )
                     break;
 
                 case LVM_VOLUME_STATUS_BOOTABLE:
-                    WinLoadString( pGlobal->hab, pGlobal->hmri,
+                    WinLoadString( hab, hmri,
                                    IDS_STATUS_BOOTABLE, STRING_RES_MAXZ, szRes );
                     pRec->pszFlags = strdup( szRes );
                     break;
 
                 case LVM_VOLUME_STATUS_STARTABLE:
-                    WinLoadString( pGlobal->hab, pGlobal->hmri,
+                    WinLoadString( hab, hmri,
                                    IDS_STATUS_STARTABLE, STRING_RES_MAXZ, szRes );
                     pRec->pszFlags = strdup( szRes );
                     break;
 
                 case LVM_VOLUME_STATUS_INSTALLABLE:
-                    WinLoadString( pGlobal->hab, pGlobal->hmri,
+                    WinLoadString( hab, hmri,
                                    IDS_STATUS_INSTALLABLE, STRING_RES_MAXZ, szRes );
                     pRec->pszFlags = strdup( szRes );
                     break;
             }
         }
-        else if ( pGlobal->volumes[ i ].iPartitions > 1 ) {
-            WinLoadString( pGlobal->hab, pGlobal->hmri,
+        else if ( volumes[ i ].iPartitions > 1 ) {
+            WinLoadString( hab, hmri,
                            IDS_STATUS_SPANNED, STRING_RES_MAXZ, szRes );
             pRec->pszFlags = strdup( szRes );
         }
@@ -2637,8 +3036,7 @@ void VolumeContainerPopulate( PDVMGLOBAL pGlobal )
     rins.fInvalidateRecord = TRUE;
     rins.cRecordsInsert    = ulCount;
 
-    WinSendDlgItemMsg( pGlobal->hwndVolumes, IDD_VOLUMES, CM_INSERTRECORD,
-                       MPFROMP( pRecAll ), MPFROMP( &rins ));
+    WinSendMsg( hwndCnr, CM_INSERTRECORD, MPFROMP( pRecAll ), MPFROMP( &rins ));
 
 }
 
@@ -2713,17 +3111,140 @@ void VolumeContainerClear( PDVMGLOBAL pGlobal )
 
 
 /* ------------------------------------------------------------------------- *
+ * DiskListSelect()                                                          *
+ *                                                                           *
+ * Handles selection events of disks in the disks list.  (Selection of       *
+ * individual partitions, which could be triggered at the same time, are     *
+ * handled in DiskListPartitionSelect.)                                      *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND hwnd     : Client window handle                                    *
+ *   USHORT usDisk : Array index number of the disk                          *
+ *   BOOL bSelected: TRUE if a disk is selected, FALSE otherwise             *
+ *                                                                           *
+ * RETURNS: N/A                                                              *
+ * ------------------------------------------------------------------------- */
+void DiskListSelect( HWND hwnd, USHORT usDisk, BOOL bSelected )
+{
+    PDVMGLOBAL  pGlobal;
+
+    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+    if ( bSelected && ( pGlobal->disks[ usDisk ].fUnusable ))
+        bSelected = FALSE;
+
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_DISK, bSelected? TRUE: FALSE );
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * DiskListPartitionSelect()                                                 *
+ *                                                                           *
+ * Handles selection events of partitions in the disks list.                 *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND        hwnd   : Client window handle                               *
+ *   PDISKNOTIFY pNotify: Disk list notification structure                   *
+ *                                                                           *
+ * RETURNS: N/A                                                              *
+ * ------------------------------------------------------------------------- */
+void DiskListPartitionSelect( HWND hwnd, HWND hwndPartition )
+{
+    Partition_Information_Record pir;
+    PDVMGLOBAL       pGlobal;
+    PDVMVOLUMERECORD pVolRec;
+    PVCTLDATA  pvd  = {0};
+    WNDPARAMS  wndp = {0};
+    CARDINAL32 iErr;
+    BOOL       fFreeSpace,
+               fActive,
+               fBootable,
+               fCanBeBootable;
+
+    if ( !hwndPartition ) return;
+    pGlobal = WinQueryWindowPtr( hwnd, 0 );
+
+    wndp.fsStatus  = WPM_CTLDATA;
+    wndp.cbCtlData = sizeof( PVCTLDATA );
+    wndp.pCtlData  = &pvd;
+    if ( ! WinSendMsg( hwndPartition, WM_QUERYWINDOWPARAMS, MPFROMP( &wndp ), MPVOID ))
+        return;
+
+    Status_Partition( hwnd, &pvd );
+
+    fFreeSpace = (BOOL)( pvd.bType == LPV_TYPE_FREE );
+    fCanBeBootable = FALSE;
+
+    pir = LvmGetPartitionInfo( pvd.handle, &iErr );
+    fActive = (( iErr == LVM_ENGINE_NO_ERROR ) && pir.Primary_Partition ) ?
+                  (BOOL)( pir.Active_Flag == ACTIVE_PARTITION ) :
+                  FALSE;
+    if (( iErr == LVM_ENGINE_NO_ERROR ) && ( pGlobal->fsEngine & FS_ENGINE_BOOTMGR )) {
+        fBootable = (BOOL)(pir.On_Boot_Manager_Menu);
+        if ( pir.Partition_Status == PARTITION_IS_AVAILABLE )
+            fCanBeBootable = TRUE;
+    }
+    else
+        fBootable = FALSE;
+
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_CREATE, fFreeSpace? TRUE: FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_DELETE, fFreeSpace? FALSE: TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_RENAME, fFreeSpace? FALSE: TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_CONVERT, (pvd.fInUse || fFreeSpace)? FALSE: TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_ADD, pvd.fInUse? FALSE: TRUE );
+
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_BOOTABLE, fCanBeBootable );
+    WinCheckMenuItem( pGlobal->hwndMenu, ID_PARTITION_BOOTABLE, fBootable );
+    WinCheckMenuItem( pGlobal->hwndPopupPartition, ID_PARTITION_BOOTABLE, fBootable );
+
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition,
+                    ID_PARTITION_ACTIVE, (pvd.bType == LPV_TYPE_PRIMARY)? TRUE: FALSE );
+    WinCheckMenuItem( pGlobal->hwndMenu, ID_PARTITION_ACTIVE, fActive );
+    WinCheckMenuItem( pGlobal->hwndPopupPartition, ID_PARTITION_ACTIVE, fActive );
+
+    if (( iErr == LVM_ENGINE_NO_ERROR ) &&
+        ( pGlobal->fsProgram & FS_APP_AUTOSELECT ) && pir.Volume_Handle )
+    {
+        pVolRec = (PDVMVOLUMERECORD) WinSendDlgItemMsg( pGlobal->hwndVolumes,
+                                                        IDD_VOLUMES,
+                                                        CM_QUERYRECORD, NULL,
+                                                        MPFROM2SHORT( CMA_FIRST,
+                                                                      CMA_ITEMORDER ));
+        while ( pVolRec ) {
+            if ( pVolRec->handle == pir.Volume_Handle ) {
+                if ( !( pVolRec->record.flRecordAttr & CRA_SELECTED )) {
+                    WinSendDlgItemMsg( pGlobal->hwndVolumes, IDD_VOLUMES,
+                                       CM_SETRECORDEMPHASIS, MPFROMP( pVolRec ),
+                                       MPFROM2SHORT( TRUE, CRA_SELECTED ));
+                    VolumeContainerSelect( hwnd, pGlobal->hwndPopupVolume, pVolRec );
+                }
+                break;
+            }
+            pVolRec = (PDVMVOLUMERECORD) pVolRec->record.preccNextRecord;
+        }
+    }
+
+}
+
+
+/* ------------------------------------------------------------------------- *
  * VolumeContainerSelect()                                                   *
  *                                                                           *
  * Handles selection (highlighting) of a record in the volumes container.    *
  *                                                                           *
  * ARGUMENTS:                                                                *
- *   HWND hwnd            : Client window handle                             *
+ *   HWND hwnd            : Main program client window handle                *
+ *   HWND hwndContext     : Handle of container context menu (may be NULL)   *
  *   PDVMVOLUMERECORD pRec: Selected record handle                           *
  *                                                                           *
  * RETURNS: N/A                                                              *
  * ------------------------------------------------------------------------- */
-void VolumeContainerSelect( HWND hwnd, PDVMVOLUMERECORD pRec )
+void VolumeContainerSelect( HWND hwnd, HWND hwndContext, PDVMVOLUMERECORD pRec )
 {
     Partition_Information_Array pia;    // array of the volume's partitions
 
@@ -2735,8 +3256,11 @@ void VolumeContainerSelect( HWND hwnd, PDVMVOLUMERECORD pRec )
                    hwndDisk,            // handle of the current disk control
                    hwndPart;            // handle of the current partition control
     CARDINAL32     rc;                  // LVM API return code
+    BOOL           fLVM,
+                   fCheck;
     ULONG          ulID,                // string resource ID
                    i;                   // loop index
+    USHORT         fsEmphasis;          // partition emphasis mask
     CHAR           szRes1[ STRING_RES_MAXZ ] = {0},  // string resource buffers
                    szRes2[ STRING_RES_MAXZ ] = {0},
                    szRes3[ STRING_RES_MAXZ ] = {0};
@@ -2766,7 +3290,12 @@ void VolumeContainerSelect( HWND hwnd, PDVMVOLUMERECORD pRec )
             default:                  vi.hIcon = pGlobal->hptrStandard; break;
             case LVM_DEVICE_CDROM:    vi.hIcon = pGlobal->hptrCD;       break;
             case LVM_DEVICE_NETWORK:  vi.hIcon = pGlobal->hptrLAN;      break;
-            case LVM_DEVICE_UNKNOWN:  vi.hIcon = pGlobal->hptrUnknown;  break;
+            case LVM_DEVICE_UNKNOWN:
+                if ( strcmp( pRec->pszFS, "NDFS32") == 0 )
+                    vi.hIcon = pGlobal->hptrLAN;
+                else
+                    vi.hIcon = pGlobal->hptrUnknown;
+                break;
         }
         WinLoadString( pGlobal->hab, pGlobal->hmri,
                        ( pGlobal->fsProgram & FS_APP_IBMTERMS ) ?
@@ -2850,11 +3379,54 @@ void VolumeContainerSelect( HWND hwnd, PDVMVOLUMERECORD pRec )
             WinSendMsg( pGlobal->hwndDisks, LLM_GETPARTITION,
                         MPFROMLONG( pia.Partition_Array[i].Partition_Handle ),
                         MPFROMLONG( pia.Partition_Array[i].Drive_Handle ));
-        if ( hwndPart )
+        if ( hwndPart ) {
+            if (( pGlobal->fsProgram & FS_APP_AUTOSELECT ) && ( i == 0 )) {
+                fsEmphasis = (USHORT) WinSendMsg( hwndPart, LPM_GETEMPHASIS, 0, 0 );
+                if ( !( fsEmphasis & LPV_FS_SELECTED ))
+                    WinSendMsg( hwndPart, LPM_SETEMPHASIS,
+                                MPFROMSHORT( TRUE ),
+                                MPFROMSHORT( LPV_FS_SELECTED ));
+            }
             WinSendMsg( hwndPart, LPM_SETEMPHASIS,
                         MPFROMSHORT( TRUE ), MPFROMSHORT( LPV_FS_ACTIVE ));
+        }
     }
 
+    // Now update the allowable menu actions
+
+    // Enable the volume menu items for LVM-managed volumes
+    fLVM = (BOOL)( pVolume->bDevice <= LVM_DEVICE_PRM );
+    MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_DELETE, fLVM );
+    MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_RENAME, fLVM );
+    MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_LETTER, fLVM );
+
+    // The 'Bootable' option is only meaningful if Boot Manager is installed
+    if ( pVolume->fCompatibility && ( pGlobal->fsEngine & FS_ENGINE_BOOTMGR )) {
+        MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_BOOTABLE, TRUE );
+        fCheck = (BOOL)( pVolume->iStatus == LVM_VOLUME_STATUS_BOOTABLE );
+    }
+    else {
+        MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_BOOTABLE, FALSE );
+        fCheck = FALSE;
+    }
+    WinCheckMenuItem( pGlobal->hwndMenu, ID_VOLUME_BOOTABLE, fCheck );
+    if ( hwndContext )
+        WinCheckMenuItem( hwndContext, ID_VOLUME_BOOTABLE, fCheck );
+
+    // Only compatibility volumes consisting of a primary partition can be Startable
+    if ( pVolume->fCompatibility && pia.Count && ( pia.Partition_Array[ 0 ].Primary_Partition )) {
+        MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_STARTABLE, TRUE );
+        fCheck = (BOOL)( pVolume->iStatus == LVM_VOLUME_STATUS_STARTABLE );
+    }
+    else {
+        MenuItemEnable( pGlobal->hwndMenu, hwndContext, ID_VOLUME_STARTABLE, FALSE );
+        fCheck = FALSE;
+    }
+    WinCheckMenuItem( pGlobal->hwndMenu, ID_VOLUME_STARTABLE, fCheck );
+    if ( hwndContext )
+        WinCheckMenuItem( hwndContext, ID_VOLUME_STARTABLE, fCheck );
+
+cleanup:
     LvmFreeMem( pia.Partition_Array );
 }
 
@@ -2880,9 +3452,45 @@ void Status_Clear( HWND hwnd )
 
 
 /* ------------------------------------------------------------------------- *
+ * Status_ShowDisk()                                                         *
+ *                                                                           *
+ * Handles updating the main-window status bar when the disk list receives   *
+ * focus.                                                                    *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND hwnd    : Client window handle                                     *
+ *   HWND hwndDisk: Handle of selected disk control                          *
+ *                                                                           *
+ * RETURNS: N/A                                                              *
+ * ------------------------------------------------------------------------- */
+void Status_ShowDisk( HWND hwnd, HWND hwndDisk )
+{
+    PVCTLDATA pvd  = {0};
+    WNDPARAMS wndp = {0};
+    HWND      hwndPart;
+
+    // If a partition is selected, show its status
+    hwndPart = (HWND) WinSendMsg( hwndDisk, LDM_QUERYPARTITIONEMPHASIS,
+                                  0, MPFROMSHORT( LPV_FS_SELECTED ));
+    if ( hwndPart ) {
+        wndp.fsStatus  = WPM_CTLDATA;
+        wndp.cbCtlData = sizeof( PVCTLDATA );
+        wndp.pCtlData  = &pvd;
+        if ( WinSendMsg( hwndPart, WM_QUERYWINDOWPARAMS, MPFROMP( &wndp ), MPVOID ))
+            Status_Partition( hwnd, &pvd );
+    }
+
+    // Otherwise do nothing
+}
+
+
+/* ------------------------------------------------------------------------- *
  * Status_Volume()                                                           *
  *                                                                           *
  * Sets the main window status-bar text for the currently-selected volume.   *
+ * NOTE: We don't currently use this; at the moment, the status bar is only  *
+ * used to show the selected partition, if any.  The volume detail panel is  *
+ * sufficient for selected-volume information.                               *
  *                                                                           *
  * ARGUMENTS:                                                                *
  *   HWND hwnd            : Client window handle                             *
@@ -2980,44 +3588,22 @@ void Status_Volume( HWND hwnd, PDVMVOLUMERECORD pRec )
  * Sets the main window status-bar text for the currently-selected partition.*
  *                                                                           *
  * ARGUMENTS:                                                                *
- *   HWND hwnd            : Client window handle                             *
+ *   HWND       hwnd : Client window handle                                  *
+ *   PPVCTLDATA pPart: Selected partition's ctldata                          *
  *                                                                           *
  * RETURNS: N/A                                                              *
  * ------------------------------------------------------------------------- */
-void Status_Partition( HWND hwnd, HWND hPart )
+void Status_Partition( HWND hwnd, PPVCTLDATA pPart )
 {
-    Partition_Information_Record pir;
-
-    CARDINAL32     rc;
-    WNDPARAMS      wp = {0};
-    PDVMGLOBAL     pGlobal;                         // global application data
-    PPVCTLDATA     pPart;                           // current partition ctldata
-    ULONG          ulID;                            // string resource ID
-    CHAR           szRes1[ STRING_RES_MAXZ ] = {0}, // string resource buffers
-                   szRes2[ STRING_RES_MAXZ ] = {0},
-                   szRes3[ STRING_RES_MAXZ ] = {0};
+    PDVMGLOBAL pGlobal;                             // global application data
+    ULONG      ulID;                                // string resource ID
+    CHAR       szRes1[ STRING_RES_MAXZ ] = {0},     // string resource buffers
+               szRes2[ STRING_RES_MAXZ ] = {0},
+               szRes3[ STRING_RES_MAXZ ] = {0};
 
 
     pGlobal = WinQueryWindowPtr( hwnd, 0 );
     if ( !pGlobal ) return;
-
-    // Get the LVM information for the indicated partition
-    wp.fsStatus  = WPM_CTLDATA;
-    wp.cbCtlData = sizeof( PVCTLDATA );
-    pPart = (PPVCTLDATA) calloc( 1, wp.cbCtlData );
-    if ( !pPart ) return;
-    wp.pCtlData  = (PVOID) pPart;
-    if ( ! (BOOL) WinSendMsg( hPart, WM_QUERYWINDOWPARAMS, MPFROMP( &wp ), 0 ))
-    {
-        free( pPart );
-        return;
-    }
-    pir = LvmGetPartitionInfo( pPart->handle, &rc );
-    if ( rc != LVM_ENGINE_NO_ERROR ) {
-        free( pPart );
-        return;
-    }
-
 
     // Status 1: selected object (partition)
 
@@ -3050,23 +3636,20 @@ void Status_Partition( HWND hwnd, HWND hPart )
                    IDS_STATUS_FORMAT, STRING_RES_MAXZ, szRes1 );
     sprintf( szRes2, "%02X", pPart->bOS );
     sprintf( szRes3, szRes1, szRes2 );
+    if ( strlen( pPart->szFS )) {
+        sprintf( szRes1, "  -  %s", pPart->szFS );
+        strncat( szRes3, szRes1, STRING_RES_MAXZ-1 );
+    }
     WinSetDlgItemText( hwnd, IDD_STATUS_TYPE, szRes3 );
 
 
     // Status 4: flags (available/in use)
-
-    switch ( pir.Partition_Status ) {
-        case PARTITION_IS_IN_USE:
-            ulID = IDS_STATUS_INUSE;
-            break;
-        case PARTITION_IS_AVAILABLE:
-            ulID = IDS_STATUS_AVAILABLE;
-            break;
-        default:
-        case PARTITION_IS_FREE_SPACE:
-            ulID = 0;
-            break;
-    }
+    if ( pPart->bType == LPV_TYPE_FREE )
+        ulID = 0;
+    else if ( pPart->fInUse )
+        ulID = IDS_STATUS_INUSE;
+    else
+        ulID = IDS_STATUS_AVAILABLE;
     if ( ulID ) {
         WinLoadString( pGlobal->hab, pGlobal->hmri,
                        ulID, STRING_RES_MAXZ, szRes1 );
@@ -3075,7 +3658,6 @@ void Status_Partition( HWND hwnd, HWND hPart )
     else
         WinSetDlgItemText( hwnd, IDD_STATUS_FLAGS, "");
 
-    free( pPart );
 }
 
 
@@ -3207,7 +3789,7 @@ void ChangeSizeDisplay( HWND hwnd, PDVMGLOBAL pGlobal )
                                           MPFROMP( CMA_FIRST ),
                                           MPFROMSHORT( CRA_SELECTED ));
     if ( pRec && ( (ULONG) pRec != -1 ))
-        VolumeContainerSelect( hwnd, pRec );
+        VolumeContainerSelect( hwnd, pGlobal->hwndPopupVolume, pRec );
 
 }
 
@@ -3267,7 +3849,7 @@ void ChangeVolumeTypeDisplay( HWND hwnd, PDVMGLOBAL pGlobal )
                                           MPFROMP( CMA_FIRST ),
                                           MPFROMSHORT( CRA_SELECTED ));
     if ( pRec && ( (ULONG) pRec != -1 ))
-        VolumeContainerSelect( hwnd, pRec );
+        VolumeContainerSelect( hwnd, pGlobal->hwndPopupVolume, pRec );
 
 }
 
@@ -3287,9 +3869,9 @@ void ChangeVolumeTypeDisplay( HWND hwnd, PDVMGLOBAL pGlobal )
  * ------------------------------------------------------------------------- */
 void SetBootMgrActions( PDVMGLOBAL pGlobal )
 {
-    HWND     hBMgrMenu,
-             hVolMenu,
-             hPartMenu;
+    HWND     hBMgrMenu    = NULLHANDLE,
+             hVolMenu     = NULLHANDLE,
+             hPartMenu    = NULLHANDLE;
     MENUITEM mi;
     CHAR     szRes[ STRING_RES_MAXZ ];
     SHORT    asIDs[ 6 ];
@@ -3298,31 +3880,38 @@ void SetBootMgrActions( PDVMGLOBAL pGlobal )
     if ( !pGlobal ) return;
 
     // Get the handles of the various submenus that we need...
-    if ( ! winhQueryMenuItem( pGlobal->hwndMenu, IDM_LVM_BOOTMGR, TRUE, &mi ))
-        return;
-    hBMgrMenu = mi.hwndSubMenu;
-    if ( ! winhQueryMenuItem( pGlobal->hwndMenu, IDM_VOLUME, TRUE, &mi ))
-        return;
-    hVolMenu = mi.hwndSubMenu;
-    if ( ! winhQueryMenuItem( pGlobal->hwndMenu, IDM_PARTITION, TRUE, &mi ))
-        return;
-    hPartMenu = mi.hwndSubMenu;
+    if ( winhQueryMenuItem( pGlobal->hwndMenu, IDM_LVM_BOOTMGR, TRUE, &mi ))
+        hBMgrMenu = mi.hwndSubMenu;
+    if ( winhQueryMenuItem( pGlobal->hwndMenu, IDM_VOLUME, TRUE, &mi ))
+        hVolMenu = mi.hwndSubMenu;
+    if ( winhQueryMenuItem( pGlobal->hwndMenu, IDM_PARTITION, TRUE, &mi ))
+        hPartMenu = mi.hwndSubMenu;
 
     /* First, we remove all BootManager/Air-Boot specific menu items.  This
      * will allow us to selectively add the appropriate ones back in without
      * having to worry about messing up the order.
      */
-    WinSendMsg( hVolMenu, MM_DELETEITEM,
-                MPFROM2SHORT( ID_VOLUME_BOOTABLE, TRUE ), 0 );
-    WinSendMsg( hPartMenu, MM_DELETEITEM,
-                MPFROM2SHORT( ID_PARTITION_BOOTABLE, TRUE ), 0 );
+    if ( hVolMenu )
+        WinSendMsg( hVolMenu, MM_DELETEITEM,
+                    MPFROM2SHORT( ID_VOLUME_BOOTABLE, TRUE ), 0 );
+    if ( pGlobal->hwndPopupVolume )
+        WinSendMsg( pGlobal->hwndPopupVolume, MM_DELETEITEM,
+                    MPFROM2SHORT( ID_VOLUME_BOOTABLE, TRUE ), 0 );
+    if ( hPartMenu )
+        WinSendMsg( hPartMenu, MM_DELETEITEM,
+                    MPFROM2SHORT( ID_PARTITION_BOOTABLE, TRUE ), 0 );
+    if ( pGlobal->hwndPopupPartition )
+        WinSendMsg( pGlobal->hwndPopupPartition, MM_DELETEITEM,
+                    MPFROM2SHORT( ID_PARTITION_BOOTABLE, TRUE ), 0 );
+
     asIDs[ 0 ] = ID_AIRBOOT_INSTALL;
     asIDs[ 1 ] = ID_AIRBOOT_REMOVE;
     asIDs[ 2 ] = IDM_BM_SEPARATOR;
     asIDs[ 3 ] = ID_BM_OPTIONS;
     asIDs[ 4 ] = ID_BM_INSTALL;
     asIDs[ 5 ] = ID_BM_REMOVE;
-    winhRemoveMenuItems( hBMgrMenu, asIDs, 6 );
+    if ( hBMgrMenu )
+        winhRemoveMenuItems( hBMgrMenu, asIDs, 6 );
 
     // If the menu is to remain otherwise empty, just add an information item
     if ( ! ( pGlobal->fsProgram & FS_APP_ENABLE_AB ) &&
@@ -3377,7 +3966,11 @@ void SetBootMgrActions( PDVMGLOBAL pGlobal )
                        IDS_MENU_BOOTABLE, STRING_RES_MAXZ, szRes );
         MenuItemAddCnd( hVolMenu, 6,
                         ID_VOLUME_BOOTABLE, szRes, MIS_TEXT );
+        MenuItemAddCnd( pGlobal->hwndPopupVolume, 6,
+                        ID_VOLUME_BOOTABLE, szRes, MIS_TEXT );
         MenuItemAddCnd( hPartMenu, 8,
+                        ID_PARTITION_BOOTABLE, szRes, MIS_TEXT );
+        MenuItemAddCnd( pGlobal->hwndPopupPartition, 8,
                         ID_PARTITION_BOOTABLE, szRes, MIS_TEXT );
 
     }
@@ -3395,17 +3988,17 @@ void SetBootMgrActions( PDVMGLOBAL pGlobal )
                        IDS_MENU_BOOTABLE, STRING_RES_MAXZ, szRes );
         MenuItemAddCnd( hVolMenu, MIT_END,
                         ID_VOLUME_BOOTABLE, szRes, MIS_TEXT );
+        MenuItemAddCnd( pGlobal->hwndPopupPartition, MIT_END,
+                        ID_VOLUME_BOOTABLE, szRes, MIS_TEXT );
         MenuItemAddCnd( hPartMenu, MIT_END,
+                        ID_PARTITION_BOOTABLE, szRes, MIS_TEXT );
+        MenuItemAddCnd( pGlobal->hwndPopupPartition, MIT_END,
                         ID_PARTITION_BOOTABLE, szRes, MIS_TEXT );
     }
 
     // Disable the Bootable menu options by default
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_VOLUME_BOOTABLE, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_PARTITION_BOOTABLE, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_VOLUME_BOOTABLE,    FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, pGlobal->hwndPopupPartition, ID_PARTITION_BOOTABLE, FALSE );
 }
 
 
@@ -3429,59 +4022,31 @@ void SetAvailableActions( HWND hwnd )
     if ( !pGlobal ) return;
 
     // Always enable these items (as long as LVM is open )
-
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_LVM_BOOTMGR, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, 0 ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_VOLUME, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, 0 ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_PARTITION, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, 0 ));
-
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_LVM_NEWMBR, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, 0 ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_LVM_REFRESH, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, 0 ));
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_LVM_BOOTMGR, TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_VOLUME, TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_PARTITION, TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_NEWMBR, TRUE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_REFRESH,  TRUE );
 
     // Enable Air-Boot removal if (and only if) Air-Boot is installed
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_AIRBOOT_REMOVE, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED,
-                              ( pGlobal->fsEngine & FS_ENGINE_AIRBOOT ) ?
-                              0 : MIA_DISABLED ));
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_AIRBOOT_REMOVE,
+                    (BOOL)( pGlobal->fsEngine & FS_ENGINE_AIRBOOT ));
 
     // Disable Air-Boot install if the install program is missing
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_AIRBOOT_INSTALL, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED,
-                              ( pGlobal->fsProgram & FS_APP_ENABLE_AB ) ?
-                              0 : MIA_DISABLED ));
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_AIRBOOT_INSTALL,
+                    (BOOL)( pGlobal->fsProgram & FS_APP_ENABLE_AB ));
 
     if ( pGlobal->fsEngine & FS_ENGINE_BOOTMGR ) {
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_INSTALL, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_REMOVE, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, 0 ));
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_OPTIONS, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, 0 ));
+        // If IBM Boot Manager is installed...
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_INSTALL, FALSE );
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_REMOVE,  TRUE );
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_OPTIONS, TRUE );
     }
     else {
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_INSTALL, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, 0 ));
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_REMOVE, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_BM_OPTIONS, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
+        // Otherwise...
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_INSTALL, TRUE );
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_REMOVE,  FALSE );
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_BM_OPTIONS, FALSE );
     }
 
     // Leave ID_LVM_DISK disabled (will enable when a disk is selected)
@@ -3519,9 +4084,7 @@ void SetModified( HWND hwnd, BOOL fModified )
         pGlobal->fsEngine |= FS_ENGINE_PENDING;
 
         // Enable the Save menuitem
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_LVM_SAVE, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, 0 ));
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_SAVE, TRUE );
 
         // Update the status display
         WinLoadString( pGlobal->hab, pGlobal->hmri,
@@ -3530,9 +4093,7 @@ void SetModified( HWND hwnd, BOOL fModified )
     }
     else {
         pGlobal->fsEngine &= ~FS_ENGINE_PENDING;
-        WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                    MPFROM2SHORT( ID_LVM_SAVE, TRUE ),
-                    MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
+        MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_SAVE, FALSE );
         WinSetDlgItemText( hwnd, IDD_STATUS_MODIFIED, "");
     }
 }
@@ -3588,21 +4149,11 @@ void LVM_Stop( PDVMGLOBAL pGlobal )
     LvmClose();
 
     // Disable these menu items
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_LVM_BOOTMGR, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_LVM_NEWMBR, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( ID_LVM_REFRESH, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_VOLUME, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-    WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                MPFROM2SHORT( IDM_PARTITION, TRUE ),
-                MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_LVM_BOOTMGR, FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_NEWMBR,   FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, ID_LVM_REFRESH,  FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_VOLUME,      FALSE );
+    MenuItemEnable( pGlobal->hwndMenu, NULL, IDM_PARTITION,   FALSE );
 
     if ( pGlobal->pLog ) {
         fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
@@ -3838,11 +4389,23 @@ void LVM_Refresh( HWND hwnd )
 
     // Now get the current data from LVM
     LvmRefresh( &rc );
+    if ( pGlobal->pLog ) {
+        fprintf( pGlobal->pLog, "===============================================================================\n");
+        if ( rc != LVM_ENGINE_NO_ERROR )
+            fprintf( pGlobal->pLog, "Failed to refresh LVM Engine (error code %u)\n", rc );
+        else
+            fprintf( pGlobal->pLog, "Refreshed LVM Engine successfully\n");
+    }
+
     LVM_InitData( hwnd, pGlobal );
     pGlobal->fsEngine &= ~FS_ENGINE_REFRESH;
 
     // Repopulate the GUI
-    VolumeContainerPopulate( pGlobal );
+    VolumeContainerPopulate( WinWindowFromID( pGlobal->hwndVolumes, IDD_VOLUMES ),
+                             pGlobal->volumes, pGlobal->ulVolumes,
+                             pGlobal->hab, pGlobal->hmri,
+                             pGlobal->fsProgram, FALSE
+                           );
     DiskListPopulate( hwnd );
 
     // Re-select the previously selected disk+partition (if they still exist)
@@ -3860,10 +4423,12 @@ void LVM_Refresh( HWND hwnd )
                                NULL, MPFROM2SHORT( CMA_FIRST, CMA_ITEMORDER ));
         while ( pVol && ( pGlobal->volumes[ pVol->ulVolume ].handle != hVolume ))
             pVol = (PDVMVOLUMERECORD) pVol->record.preccNextRecord;
-        if ( pVol && pGlobal->volumes[ pVol->ulVolume ].handle == hVolume )
+        if ( pVol && pGlobal->volumes[ pVol->ulVolume ].handle == hVolume ) {
             WinSendDlgItemMsg( pGlobal->hwndVolumes, IDD_VOLUMES,
                                CM_SETRECORDEMPHASIS, MPFROMP( pVol ),
                                MPFROM2SHORT( TRUE, CRA_SELECTED ));
+            VolumeContainerSelect( hwnd, pGlobal->hwndPopupVolume, pVol );
+        }
     }
 
     // Update the menu options as needed
@@ -3872,88 +4437,10 @@ void LVM_Refresh( HWND hwnd )
     // Force a statusbar update
     hwndFocus = WinQueryFocus( HWND_DESKTOP );
     if ( hwndFocus == pGlobal->hwndDisks )
-        Status_Partition( hwnd, hwndPart );
+        DiskListPartitionSelect( hwnd, hwndPart );
     else
         WinSendMsg( hwndDisk, LDM_SETEMPHASIS, 0,
                     MPFROM2SHORT( FALSE, LPV_FS_SELECTED ));
-}
-
-
-/* ------------------------------------------------------------------------- *
- * Log_DiskInfo()                                                            *
- *                                                                           *
- * Writes a summary of the disk layout to the log file (if logging is        *
- * enabled).                                                                 *
- *                                                                           *
- * ARGUMENTS:                                                                *
- *   PDVMGLOBAL pGlobal : Structure containing global program data           *
- *                                                                           *
- * RETURNS: N/A                                                              *
- * ------------------------------------------------------------------------- */
-void Log_DiskInfo( PDVMGLOBAL pGlobal )
-{
-    ULONG   i;
-
-    if ( !pGlobal->pLog ) return;
-
-    fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
-    fprintf( pGlobal->pLog, "LVM Summary: Physical\n" );
-    fprintf( pGlobal->pLog, "%u disk drives reported.\n", pGlobal->ulDisks );
-
-    for ( i = 0; i < pGlobal->ulDisks; i++ ) {
-        fprintf( pGlobal->pLog, "\n");
-        fprintf( pGlobal->pLog, "Disk %02u: \"%s\"\n",
-                 pGlobal->disks[ i ].iNumber,
-                 pGlobal->disks[ i ].szName );
-        fprintf( pGlobal->pLog, "         Unusable: %u   Corrupt: %u   PRM: %u   Big Floppy: %u\n",
-                 pGlobal->disks[ i ].fUnusable,
-                 pGlobal->disks[ i ].fCorrupt,
-                 pGlobal->disks[ i ].fPRM,
-                 pGlobal->disks[ i ].fBigFloppy );
-        fprintf( pGlobal->pLog, "         %u MiB\n",
-                 pGlobal->disks[ i ].iSize );
-    }
-
-}
-
-
-/* ------------------------------------------------------------------------- *
- * Log_VolumeInfo()                                                          *
- *                                                                           *
- * Writes a summary of the current volumes to the log file (if logging is    *
- * enabled).                                                                 *
- *                                                                           *
- * ARGUMENTS:                                                                *
- *   PDVMGLOBAL pGlobal : Structure containing global program data           *
- *                                                                           *
- * RETURNS: N/A                                                              *
- * ------------------------------------------------------------------------- */
-void Log_VolumeInfo( PDVMGLOBAL pGlobal )
-{
-    ULONG   i;
-
-    if ( !pGlobal->pLog ) return;
-
-    fprintf( pGlobal->pLog, "-------------------------------------------------------------------------------\n");
-    fprintf( pGlobal->pLog, "LVM Summary: Logical\n" );
-    fprintf( pGlobal->pLog, "%u volumes reported.\n", pGlobal->ulVolumes );
-
-    for ( i = 0; i < pGlobal->ulVolumes; i++ ) {
-        fprintf( pGlobal->pLog, "\n");
-        fprintf( pGlobal->pLog, "%c: \"%s\" (%s)\n",
-                 pGlobal->volumes[ i ].cLetter,
-                 pGlobal->volumes[ i ].szName,
-                 pGlobal->volumes[ i ].szFS );
-        fprintf( pGlobal->pLog, "   Preferred: %c   Initial: %c   Type: %s   Status: %u   Device: %u\n",
-                 pGlobal->volumes[ i ].cPreference,
-                 pGlobal->volumes[ i ].cInitial,
-                 pGlobal->volumes[ i ].fCompatibility ? "Compatibility": "LVM",
-                 pGlobal->volumes[ i ].fBootable,
-                 pGlobal->volumes[ i ].bDevice );
-        fprintf( pGlobal->pLog, "   %u MiB\n",
-                 pGlobal->volumes[ i ].iSize );
-    }
-
 }
 
 
@@ -3965,13 +4452,16 @@ void Log_VolumeInfo( PDVMGLOBAL pGlobal )
  * ARGUMENTS:                                                                *
  *   PDVMGLOBAL pGlobal   : Application global data                          *
  *   PLONG pX, pY, pW, pH : Returned window position/size coordinates        *
+ *   PLONG pS             : Returned splitbar position                       *
  *                                                                           *
  * RETURNS: N/A                                                              *
  * ------------------------------------------------------------------------- */
-void Settings_Load( PDVMGLOBAL pGlobal, PLONG pX, PLONG pY, PLONG pW, PLONG pH )
+void Settings_Load( PDVMGLOBAL pGlobal, PLONG pX, PLONG pY, PLONG pW, PLONG pH, PLONG pS )
 {
-    ULONG cb;               // size of profile item
-    RECTL rcl;              // loaded window position
+    ULONG  cb;               // size of profile item
+    RECTL  rcl;              // loaded window position
+    LONG   lSplit;
+    USHORT fsPrefs;          // initial preferences mask
 
     // Load the window position & size
     if ( PrfQueryProfileSize( HINI_USERPROFILE, SZ_INI_APP,
@@ -3992,21 +4482,34 @@ void Settings_Load( PDVMGLOBAL pGlobal, PLONG pX, PLONG pY, PLONG pW, PLONG pH )
         *pH = 0;
     }
 
+    // Load the splitbar position
+    lSplit = 0;
+    if ( PrfQueryProfileSize( HINI_USERPROFILE, SZ_INI_APP,
+                              SZ_INI_KEY_SPLITBAR, &cb ) &&
+         ( cb == sizeof( LONG )))
+    {
+        PrfQueryProfileData( HINI_USERPROFILE, SZ_INI_APP,
+                             SZ_INI_KEY_SPLITBAR, &lSplit, &cb );
+    }
+    *pS = lSplit;
+
     // Load the preference flags
     if ( PrfQueryProfileSize( HINI_USERPROFILE, SZ_INI_APP,
                               SZ_INI_KEY_FLAGS, &cb ) &&
          ( cb == sizeof( USHORT )))
     {
         PrfQueryProfileData( HINI_USERPROFILE, SZ_INI_APP,
-                             SZ_INI_KEY_FLAGS, &(pGlobal->fsProgram), &cb );
+                             SZ_INI_KEY_FLAGS, &fsPrefs, &cb );
+        // Clear non-preference bits just in case they got saved somehow
+        fsPrefs &= FS_APP_PREFERENCES;
     }
     else cb = 0;
-    // (Default preferences if none were found)
     if ( !cb )
-        pGlobal->fsProgram |= FS_APP_BOOTWARNING | FS_APP_PMSTYLE |
-                              FS_APP_ENABLE_BM | FS_APP_ENABLE_AB;
-    // (Clear non-preference bits just in case they got turned on somehow)
-    pGlobal->fsProgram &= FS_APP_PREFERENCES;
+    // (Default preferences if none were found)
+        fsPrefs = FS_APP_BOOTWARNING | FS_APP_PMSTYLE |
+                  FS_APP_ENABLE_BM | FS_APP_ENABLE_AB;
+
+    pGlobal->fsProgram |= fsPrefs;
 
     // Load the font selections
     PrfQueryProfileString( HINI_USERPROFILE, SZ_INI_APP, SZ_INI_KEY_FONT_STB,
@@ -4038,6 +4541,7 @@ void Settings_Save( HWND hwndFrame, PDVMGLOBAL pGlobal )
     SWP    wp;              // result from WinQueryWindowPos
     RECTL  rcl;             // saved window size/position
     USHORT fsPref;          // configured preference flags to save
+    LONG   lSplit;          // splitbar position
 
     // Save the window position
     if ( WinQueryWindowPos( hwndFrame, &wp )) {
@@ -4048,6 +4552,11 @@ void Settings_Save( HWND hwndFrame, PDVMGLOBAL pGlobal )
         PrfWriteProfileData( HINI_USERPROFILE, SZ_INI_APP,
                              SZ_INI_KEY_POSITION, &rcl, sizeof( RECTL ));
     }
+    // Save the splitbar position
+    lSplit = ctlQuerySplitPos( pGlobal->hwndSplit );
+    if ( lSplit )
+        PrfWriteProfileData( HINI_USERPROFILE, SZ_INI_APP,
+                             SZ_INI_KEY_SPLITBAR, &lSplit, sizeof( LONG ));
 
     // Save the preference flags
     fsPref = pGlobal->fsProgram & FS_APP_PREFERENCES;
@@ -4067,66 +4576,4 @@ void Settings_Save( HWND hwndFrame, PDVMGLOBAL pGlobal )
                            (PSZ) pGlobal->szFontDlgs );
 }
 
-
-/* ------------------------------------------------------------------------- *
- * System_RewriteMBR()                                                       *
- *                                                                           *
- * Forces an immediate rewrite of the Master Boot Record on the first disk   *
- * drive (prompting for confirmation first).                                 *
- *                                                                           *
- * ARGUMENTS:                                                                *
- *   HWND hwnd: application client window handle                             *
- *                                                                           *
- * RETURNS: N/A                                                              *
- * ------------------------------------------------------------------------- */
-void System_RewriteMBR( HWND hwnd )
-{
-    PDVMGLOBAL   pGlobal;
-    UCHAR        szRes1[ STRING_RES_MAXZ ],
-                 szRes2[ STRING_RES_MAXZ ],
-                 szBuffer[ STRING_RES_MAXZ * 3 ];
-    USHORT       cb;
-    CARDINAL32   rc;
-
-
-    pGlobal = WinQueryWindowPtr( hwnd, 0 );
-    if ( !pGlobal ) return;
-
-    cb = sizeof( szBuffer );
-    WinLoadString( pGlobal->hab, pGlobal->hmri,
-                   IDS_NEWMBR_TITLE, STRING_RES_MAXZ, szRes1 );
-    WinLoadString( pGlobal->hab, pGlobal->hmri,
-                   IDS_NEWMBR_CONFIRM, STRING_RES_MAXZ, szBuffer );
-    if ( pGlobal->fsEngine & FS_ENGINE_AIRBOOT )
-        WinLoadString( pGlobal->hab, pGlobal->hmri,
-                       IDS_NEWMBR_WARN_1, STRING_RES_MAXZ, szRes2 );
-    else
-        WinLoadString( pGlobal->hab, pGlobal->hmri,
-                       IDS_NEWMBR_WARN_2, STRING_RES_MAXZ, szRes2 );
-    strncat( szBuffer, szRes2, cb );
-    WinLoadString( pGlobal->hab, pGlobal->hmri,
-                   IDS_PROCEED_CONFIRM, STRING_RES_MAXZ, szRes2 );
-    strncat( szBuffer, szRes2, cb );
-    strncat( szBuffer, "\r\n\n", cb );
-    if ( WinMessageBox( HWND_DESKTOP, hwnd, szBuffer, szRes1, 0,
-                        MB_YESNO | MB_WARNING | MB_MOVEABLE ) == MBID_YES )
-    {
-        LvmNewMBR( pGlobal->disks[ 0 ].handle, &rc );
-        if ( rc != LVM_ENGINE_NO_ERROR )
-            PopupEngineError( NULL, rc, hwnd, pGlobal->hab, pGlobal->hmri );
-        else {
-            SetModified( hwnd, TRUE );
-            pGlobal->fsEngine &= ~FS_ENGINE_AIRBOOT;
-            WinSendMsg( pGlobal->hwndMenu, MM_SETITEMATTR,
-                        MPFROM2SHORT( ID_AIRBOOT_REMOVE, TRUE ),
-                        MPFROM2SHORT( MIA_DISABLED, MIA_DISABLED ));
-            WinLoadString( pGlobal->hab, pGlobal->hmri,
-                           IDS_SUCCESS_TITLE, STRING_RES_MAXZ, szRes1 );
-            WinLoadString( pGlobal->hab, pGlobal->hmri,
-                           IDS_NEWMBR_OK, STRING_RES_MAXZ, szRes2 );
-            WinMessageBox( HWND_DESKTOP, hwnd, szRes2, szRes1, 0,
-                           MB_OK | MB_INFORMATION | MB_MOVEABLE );
-        }
-    }
-}
 

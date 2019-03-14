@@ -1,3 +1,23 @@
+/*****************************************************************************
+ * lvmcalls.h                                                                *
+ *                                                                           *
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *   This program is free software; you can redistribute it and/or modify it *
+ *   under the terms of the GNU General Public License as published by the   *
+ *   Free Software Foundation; either version 2 of the License, or (at your  *
+ *   option) any later version.                                              *
+ *                                                                           *
+ *   This program is distributed in the hope that it will be useful, but     *
+ *   WITHOUT ANY WARRANTY; without even the implied warranty of              *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU       *
+ *   General Public License for more details.                                *
+ *                                                                           *
+ *   You should have received a copy of the GNU General Public License along *
+ *   with this program; if not, write to the Free Software Foundation, Inc., *
+ *   59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                 *
+ *****************************************************************************/
+
 #ifndef OS2_INCLUDED
     #include <os2.h>
 #endif
@@ -8,17 +28,19 @@
  ** CONSTANTS                                                               **
  *****************************************************************************/
 
+// Additional error codes
+#define LVM_ERROR_INCOMPATIBLE_PARTITIONING     0x1000
+
 // Sector size
 #define LVM_BYTES_PER_SECTOR            BYTES_PER_SECTOR
 #define LVM_SECTORS_PER_MiB             ( 1048576 / BYTES_PER_SECTOR )
-
+#define LVM_SECTOR_ROUNDFIX             (( BYTES_PER_SECTOR / 2 ) - 1 )
 
 // Volume boot status
 #define LVM_VOLUME_STATUS_NONE          0   // None
 #define LVM_VOLUME_STATUS_BOOTABLE      1   // Bootable
 #define LVM_VOLUME_STATUS_STARTABLE     2   // Startable
 #define LVM_VOLUME_STATUS_INSTALLABLE   3   // Installable
-
 
 // Volume device type
 #define LVM_DEVICE_HDD                  LVM_HARD_DRIVE  // 0 - hard disk drive
@@ -27,12 +49,11 @@
 #define LVM_DEVICE_NETWORK              NETWORK_DRIVE   // 3 - network (not controlled by LVM)
 #define LVM_DEVICE_UNKNOWN              NON_LVM_DEVICE  // 4 - unknown (not controlled by LVM)
 
-
 // Possible constraints on a newly-created partition
 #define LVM_CONSTRAINED_NONE            0
 #define LVM_CONSTRAINED_PRIMARY         1
 #define LVM_CONSTRAINED_LOGICAL         2
-#define LVM_CONSTRAINED_UNUSEABLE       9
+#define LVM_CONSTRAINED_UNUSABLE        9
 
 #define LVM_BOOT_TIMEOUT_LIMIT          999   // Maximum Boot Manager timeout value
 
@@ -127,17 +148,17 @@
  *****************************************************************************/
 
 // Convert a number of sectors into megabytes
-#define SECS_TO_MiB( iSecs )    ( iSecs >> 11 )
+#define SECS_TO_MiB( iSecs )    (( iSecs + LVM_SECTOR_ROUNDFIX ) >> 11 )
 
 // Convert a number of megabytes into sectors
-#define MiB_TO_SECS( iMB )      ( iMB << 11 )
+#define MiB_TO_SECS( iMB )      (( iMB << 11 ) - LVM_SECTOR_ROUNDFIX )
 
 
 /*****************************************************************************
  ** DATA TYPES                                                              **
  *****************************************************************************/
 
-// Convienient pointer definitions for basic LVM types
+// Convenient pointer definitions for basic LVM types
 typedef ADDRESS     *PADDRESS;
 typedef BOOLEAN     *PBOOLEAN;
 typedef CARDINAL    *PCARDINAL;

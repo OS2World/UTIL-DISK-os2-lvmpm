@@ -10,16 +10,18 @@
 # (make sure to edit config.in as appropriate first).  If not, a prebuilt
 # copy should be provided here.
 #
-DEBUG=1
+
+!include local.inc
 
 CC      = icc.exe
 LINK    = ilink.exe
 RC      = rc.exe
 IPFC    = ipfc.exe
+MKDESC  = $(MAKEDIR)/make/makedesc.cmd
 
 CFLAGS  = /Gm /Q /Ss /Sp /Wuse /Wpar
 LFLAGS  = /NOE /PMTYPE:PM /NOLOGO
-OBJS    = lvmpm.obj lvm_ctls.obj volume.obj utils.obj airboot.obj bootmgr.obj
+OBJS    = lvmpm.obj lvm_ctls.obj logging.obj disk.obj partition.obj volume.obj utils.obj airboot.obj bootmgr.obj
 LIBS    = lvm.lib helpers.lib
 NAME    = lvmpm
 MRI     = lvmpmmri
@@ -40,16 +42,20 @@ LANGDIR = 001
     LFLAGS = $(LFLAGS) /DEBUG
 !endif
 
+!ifdef LVM_TK
+    CFLAGS = $(CFLAGS) /I:$(LVM_TK)\include
+    LFLAGS = $(LFLAGS) /INC:$(LVM_TK)\lib
+!endif
+
 # Definitions required for xwphelpers
 !include config.in
 LVMPM_BASE  = $(MAKEDIR)
-XWPHLP_BASE = $(CVS_WORK_ROOT)\$(XWPHELPERSDIR)
-
 
 all                  : $(NAME).exe $(MRI).dll $(NAME).hlp
 
 $(NAME).exe          : $(OBJS) $(NAME).res
-                        $(LINK) $(LFLAGS) $(OBJS) $(LIBS) /OUT:$@
+                        $(MKDESC) -D"Logical Volume Manager PM" -N"Alexander Taylor" -V"^#define=SZ_VERSION,lvmpm.h" $(NAME).def
+                        $(LINK) $(LFLAGS) /MAP $(OBJS) $(LIBS) $(NAME).def /OUT:$@
                         $(RC) $(NAME).res $@
 
 
@@ -59,20 +65,27 @@ lvm_ctls.obj         : lvm_ctls.h ids.h
 
 utils.obj            : lvmpm.h ids.h
 
-airboot.obj          : lvmpm.h lvmcalls.h
+logging.obj          : lvmpm.h ids.h
 
-bootmgr.obj          : lvmpm.h lvmcalls.h
+airboot.obj          : lvmpm.h lvmcalls.h ids.h
+
+bootmgr.obj          : lvmpm.h lvmcalls.h ids.h
+
+disk.obj             : lvmpm.h lvmcalls.h lvm_ctls.h ids.h
+
+partition.obj        : lvmpm.h lvmcalls.h lvm_ctls.h ids.h
 
 volume.obj           : lvmpm.h lvmcalls.h lvm_ctls.h ids.h
 
-$(NAME).res          : $(NAME).rc
+$(NAME).res          : $(NAME).rc ids.h
                         $(RC) -r $(NAME).rc
 
-$(NAME).hlp          : {$(LANGDIR)}$(NAME).ipf
+$(NAME).hlp          : {$(LANGDIR)}$(NAME).ipf {$(LANGDIR)}errors.ipf {$(LANGDIR)}license.ipf
                         $(IPFC) -d:$(LANGDIR) $< $@
 
 $(MRI).dll           : $(MRI).obj {$(LANGDIR)}$(MRI).res
-                        $(LINK) $(LFLAGS) /DLL $< /OUT:$@
+                        $(MKDESC) -D"LVMPM language resources $(LANGDIR)" -N"Alexander Taylor" -V"^#define=SZ_VERSION,lvmpm.h" $(MRI).def
+                        $(LINK) $(LFLAGS) /DLL $(MRI).def $< /OUT:$@
                         $(RC) -x2 $(LANGDIR)\$(MRI).res $@
 
 $(MRI).obj           : $(MRI).c $(MRI).def
@@ -89,12 +102,12 @@ xwphelpers            :
                         @setlocal
                         @ $[c,$(XWPHLP_BASE),1,2]
                         %cd $(XWPHLP_BASE)
-                        @SET INCLUDE=$(XWPHLP_BASE)\include;$(LVMPM_BASE)\include;$(INCLUDE)
-                        @nmake -nologo "PROJECT_BASE_DIR=$(LVMPM_BASE)" "MAINMAKERUNNING=YES"
+                        @SET INCLUDE=$(XWPHLP_BASE)\include;$(LVMPM_BASE)\include;$(ACPI_TK)\h;$(INCLUDE)
+                        @nmake32 -nologo "PROJECT_BASE_DIR=$(LVMPM_BASE)" "MAINMAKERUNNING=YES"
                         @ $[c,$(LVMPM_BASE),1,2]
                         %cd $(LVMPM_BASE)
+                        @del *.obj
                         @endlocal
-                        copy $(LVMPM_BASE)\bin\helpers.lib $(LVMPM_BASE)\helpers.lib
 
 # Delete only language-dependent binaries
 nlvclean              :
@@ -102,5 +115,5 @@ nlvclean              :
 
 # Delete all binaries (other than the .lib files)
 clean                 : nlvclean
-                        rm -f $(OBJS) $(MRI).obj $(NAME).exe $(NAME).res
+                        rm -f *.obj $(NAME).exe $(NAME).res
 

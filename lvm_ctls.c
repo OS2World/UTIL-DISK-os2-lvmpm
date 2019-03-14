@@ -1,3 +1,23 @@
+/*****************************************************************************
+ * lvm_ctls.c                                                                *
+ *                                                                           *
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *   This program is free software; you can redistribute it and/or modify it *
+ *   under the terms of the GNU General Public License as published by the   *
+ *   Free Software Foundation; either version 2 of the License, or (at your  *
+ *   option) any later version.                                              *
+ *                                                                           *
+ *   This program is distributed in the hope that it will be useful, but     *
+ *   WITHOUT ANY WARRANTY; without even the implied warranty of              *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU       *
+ *   General Public License for more details.                                *
+ *                                                                           *
+ *   You should have received a copy of the GNU General Public License along *
+ *   with this program; if not, write to the Free Software Foundation, Inc., *
+ *   59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                 *
+ *****************************************************************************/
+
 #include "lvm_ctls.h"
 
 #ifndef DebugBox
@@ -5,6 +25,8 @@
     WinMessageBox( HWND_DESKTOP, HWND_DESKTOP, (PSZ)errmsg, "Debug", 0, MB_MOVEABLE | MB_OK | MB_ERROR )
 #endif
 
+// Convert ratio: determine x where a/b == x/y )
+#define RATIO_CONV( a, b, y )  (( a * y ) / b )
 
 // ----------------------------------------------------------------------------
 // PRIVATE DEFINITIONS FOR MODIFYING CONTROL BEHAVIOUR
@@ -71,7 +93,8 @@ typedef struct _DiskView_Private {
     ULONG       id;                        // our control ID
     USHORT      usPartitions,              // number of partition controls
                 usPartSel,                 // index of selected partition
-                fsEmphasis;                // current emphasis flags
+                fsEmphasis,                // current emphasis flags
+                fsStyle;                   // current style flags
     HPOINTER    hptrIcon;                  // handle of the disk icon
     HWND        *pPV;                      // array of partition window handles
     RECTL       rclIcon,                   // bounds of the disk icon
@@ -535,8 +558,8 @@ MRESULT EXPENTRY PVDisplayProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             WinQueryWindowRect( hwnd, &rcl );
 
             // Define some new colours
-            alClrs[ CLRIDX_PRIMARY - 16 ] = 0x00404090;     // medium blue
-            alClrs[ CLRIDX_LOGICAL - 16 ] = 0x00508090;     // medium cyan
+            alClrs[ CLRIDX_PRIMARY - 16 ] = 0x00203080;     // medium blue
+            alClrs[ CLRIDX_LOGICAL - 16 ] = 0x00307080;     // medium cyan
             alClrs[ CLRIDX_LETTER  - 16 ] = 0x00FFFFD0;     // cream/pale yellow
             alClrs[ CLRIDX_BOOTMGR - 16 ] = 0x00703080;     // dark purple
             GpiCreateLogColorTable( hps, 0, LCOLF_CONSECRGB, 16, 4, alClrs );
@@ -1504,6 +1527,21 @@ MRESULT EXPENTRY DVDisplayProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                                 MPFROMSHORT( TRUE ), MPFROMSHORT( fsMask & 0xFF ));
 
                 }
+                else {
+                    /* No partitions on disk (e.g. empty PRM). There won't be a
+                     * LPN_SELECT notification as a result, so tell our owner
+                     * we've been selected ourselves.
+                     */
+                    notify.hwndDisk      = hwnd;
+                    notify.hwndPartition = NULLHANDLE;
+                    notify.disk          = pPrivate->ctldata.handle;
+                    notify.partition     = NULLHANDLE;
+                    notify.usDisk        = pPrivate->id;
+                    notify.usPartition   = 0;
+                    WinSendMsg( hwndOwner, WM_CONTROL,
+                                MPFROM2SHORT( pPrivate->id, LDN_SELECT ),
+                                MPFROMP( &notify ));
+                }
             }
             else {
                 hwndPart = (HWND) mp1;
@@ -1534,6 +1572,7 @@ MRESULT EXPENTRY DVDisplayProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
                         DV_ClearPartitionFlags_All( fsMask & 0xFF, pPrivate );
                 }
             }
+            // Now force a redraw of the disk control
             if ( fsMask & 0xFF00 )
                 WinInvalidateRect( hwnd, NULL, TRUE );
 
@@ -1556,6 +1595,26 @@ MRESULT EXPENTRY DVDisplayProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
             else
                 fsMask = pPrivate->fsEmphasis;
             return (MRESULT) fsMask;
+
+
+        /* .................................................................. *
+         * LDM_SETSTYLE                                                       *
+         *  - mp1 (USHORT)    : New style mask                                *
+         *  - mp2             : Not used                                      *
+         * Returns 0                                                          *
+         * .................................................................. */
+        case LDM_SETSTYLE:
+            pPrivate = WinQueryWindowPtr( hwnd, 0 );
+            fsMask = (USHORT) mp1;
+            if ( pPrivate && ( pPrivate->fsStyle != fsMask )) {
+                pPrivate->fsStyle = (ULONG) mp1;
+                hps = WinBeginPaint( hwnd, NULLHANDLE, NULLHANDLE );
+                // Recalculate the layout and force a repaint
+                DV_Size( hps, hwnd, pPrivate );
+                WinEndPaint( hps );
+                WinInvalidateRect( hwnd, NULL, FALSE );
+            }
+            return (MRESULT) 0;
 
 
         /* .................................................................. *
@@ -1733,13 +1792,14 @@ void DV_Size( HPS hps, HWND hwnd, PDVPRIVATE pCtl )
 void DV_LayoutDisk( HPS hps, PDVPRIVATE pCtl )
 {
     FONTMETRICS fm;                 // current font metrics
-    LONG        lWidth, lHeight,    // adjusted dimensions of the drawing area
+    LONG        lBaseWidth,         // unadjusted width of the drawing area
+                lWidth, lHeight,    // adjusted dimensions of the drawing area
                 lMinCX,             // minimum width required for a partition
                 lCurCX,             // calculated width of current partition
                 lCurX,              // left offset of current partition
                 lTSize;             // adjusted total disk size for calculation
     USHORT      i;                  // loop index
-
+//FILE *f;
 
     // Just return if there are no partitions to lay out
     if ( !pCtl->usPartitions || !pCtl->pPartitions || !pCtl->pPV ||
@@ -1753,56 +1813,102 @@ void DV_LayoutDisk( HPS hps, PDVPRIVATE pCtl )
     lWidth -= pCtl->usPartitions - 1; // extra pel for inter-partition dividers
     lHeight = pCtl->rclGraphic.yTop - pCtl->rclGraphic.yBottom - 3;
     if ( lHeight < 1 || lWidth < 1 ) return;
+    lBaseWidth = lWidth;
 
-    /* Figure out the minimum width to allow for a partition regardless of how
-     * small it is (this is the same as the width provided for the drive letter
-     * box plus some margin)... HOWEVER, if the result would be impossible to
-     * fit within the total size of our graphic (i.e. it's been resized too
-     * small) then don't use a minimum (thereby making it the user's problem).
-     */
-    lMinCX = fm.lEmInc + ( 3 * fm.lAveCharWidth );
-    if (( lMinCX * pCtl->usPartitions ) > lWidth )
-        lMinCX = 0;
+//f = fopen("size.log", "a");
 
-    /* Now for the tricky part.  We need to determine the width to allocate for
-     * each partition-view control.  First, we see how many partitions need to
-     * have their displayable size increased to the fixed minimum size; we will
-     * then subtract these partitions from our adjusted totals (size and width)
-     * to remove them from the remaining calculations.  The adjusted total width
-     * will then be divided between the remaining partitions, based on the ratio
-     * of partition size to (adjusted) total disk size.
-     */
     lTSize = pCtl->ctldata.ulSize;
-    for ( i = 0; i < pCtl->usPartitions; i++ ) {
-        if ((( pCtl->pPartitions[ i ].ulSize * lWidth ) / lTSize ) < lMinCX )
-        {
-            lWidth -= lMinCX;
-            lTSize -= pCtl->pPartitions[ i ].ulSize;
+
+    if ( pCtl->fsStyle & LDS_FS_UNIFORM ) {                 // Uniform sizing
+        lCurX = pCtl->rclGraphic.xLeft + 2;
+        lMinCX = lWidth / pCtl->usPartitions;
+        for ( i = 0; i < pCtl->usPartitions; i++ ) {
+            pCtl->prclPV[ i ].xLeft   = lCurX;
+            pCtl->prclPV[ i ].yBottom = pCtl->rclGraphic.yBottom + 2;
+            pCtl->prclPV[ i ].yTop    = pCtl->prclPV[ i ].yBottom + lHeight;
+            if ( i + 1 == pCtl->usPartitions ) {
+                // This prevents any gap at the end due to rounding error
+                lCurCX = pCtl->rclGraphic.xRight - 1 - lCurX;
+            }
+            else {
+                lCurCX = lMinCX;
+            }
+            pCtl->prclPV[ i ].xRight  = lCurX + lCurCX;
+            WinSetWindowPos( pCtl->pPV[ i ], HWND_TOP,
+                             pCtl->prclPV[ i ].xLeft, pCtl->prclPV[ i ].yBottom,
+                             lCurCX, lHeight, SWP_SIZE | SWP_MOVE | SWP_SHOW );
+            lCurX = pCtl->prclPV[ i ].xRight + 1;
+
         }
     }
+    else {                                                  // Proportional sizing
+        /* Figure out the minimum width to allow for a partition regardless of how
+         * small it is.  HOWEVER, if the result would be impossible to fit within
+         * the total size of our disk graphic (i.e. it's been resized too small)
+         * then don't use a minimum (basically making it the user's problem).
+         */
+        lMinCX = 4 + ( 3 * fm.lEmInc );
+        if (( lMinCX * pCtl->usPartitions ) > lWidth )
+            lMinCX = 0;
 
-    lCurX = pCtl->rclGraphic.xLeft + 2;
-    for ( i = 0; i < pCtl->usPartitions; i++ ) {
-        pCtl->prclPV[ i ].xLeft   = lCurX;
-        pCtl->prclPV[ i ].yBottom = pCtl->rclGraphic.yBottom + 2;
-        pCtl->prclPV[ i ].yTop    = pCtl->prclPV[ i ].yBottom + lHeight;
-        if ( i + 1 == pCtl->usPartitions ) {
-            /* The last partition just gets all the remaining space, in order
-             * to avoid gaps left over due to rounding error.
+        /* Now we need to determine the width to allocate for each partition
+         * widget.  First, we will give lMinCX pixels to every partition.
+         * However much width is left over after that will be allocated
+         * proportionally (below) to every partition large enough to merit
+         * more than the minimum, based on how large a portion of the
+         * remaining disk space it occupies.
+         */
+        if ( lMinCX ) {
+            /* Calculate lTSize (the total size of all partitions which
+             * will be larger than the minimum) and lWidth (the graphic
+             * width left over after all partitions have been allocated
+             * their minimum).
              */
-            lCurCX = pCtl->rclGraphic.xRight - 1 - lCurX;
+            for ( i = 0; i < pCtl->usPartitions; i++ ) {
+                if ( RATIO_CONV( pCtl->pPartitions[ i ].ulSize,
+                                 pCtl->ctldata.ulSize, lWidth ) <= lMinCX )
+                    lTSize -= pCtl->pPartitions[ i ].ulSize;
+            }
+            lWidth -= lMinCX * pCtl->usPartitions;
         }
-        else {
-            lCurCX = ( pCtl->pPartitions[ i ].ulSize * lWidth ) / lTSize;
-            if ( lCurCX < lMinCX ) lCurCX = lMinCX;
-        }
-        pCtl->prclPV[ i ].xRight  = lCurX + lCurCX;
-        WinSetWindowPos( pCtl->pPV[ i ], HWND_TOP,
-                         pCtl->prclPV[ i ].xLeft, pCtl->prclPV[ i ].yBottom,
-                         lCurCX, lHeight, SWP_SIZE | SWP_MOVE | SWP_SHOW );
-        lCurX = pCtl->prclPV[ i ].xRight + 1;
-    }
+//fprintf(f, "Partitions: %d\t Size: %d\t lTSize: %d\t lBaseWidth: %d\t lMinCX: %d\t lWidth: %d\n", pCtl->usPartitions, pCtl->ctldata.ulSize, lTSize, lBaseWidth, lMinCX, lWidth );
 
+        lCurX = pCtl->rclGraphic.xLeft + 2;
+        for ( i = 0; i < pCtl->usPartitions; i++ ) {
+            pCtl->prclPV[ i ].xLeft   = lCurX;
+            pCtl->prclPV[ i ].yBottom = pCtl->rclGraphic.yBottom + 2;
+            pCtl->prclPV[ i ].yTop    = pCtl->prclPV[ i ].yBottom + lHeight;
+            if ( i + 1 == pCtl->usPartitions ) {
+                /* If we've done our calculations properly, the remaining
+                 * space will be ~the correct amount due to the last partition.
+                 * We just tell it to use all the remaining space, to allow for
+                 * the inevitable difference due to rounding error.
+                 */
+                lCurCX = pCtl->rclGraphic.xRight - 1 - lCurX;
+//fprintf(f, "P%02u (%d): \t%d\n", i, pCtl->pPartitions[ i ].ulSize, lCurCX );
+            }
+            else if ( lMinCX > 0 ) {
+                lCurCX = lMinCX;
+                if ( RATIO_CONV( pCtl->pPartitions[ i ].ulSize,
+                                 pCtl->ctldata.ulSize, lBaseWidth ) > lCurCX )
+                {
+                    lCurCX += RATIO_CONV( pCtl->pPartitions[ i ].ulSize, lTSize, lWidth );
+                }
+//fprintf(f, "P%02u (%d): \t%d + %4d\t = %d\n", i, pCtl->pPartitions[ i ].ulSize, lMinCX, lCurCX - lMinCX, lCurCX );
+            }
+            /* If lMinCX is disabled (because there's not enough space to give
+             * every partition even that much) then just divide them all equally.
+             */
+            else lCurCX = lWidth / pCtl->usPartitions;
+
+            pCtl->prclPV[ i ].xRight  = lCurX + lCurCX;
+            WinSetWindowPos( pCtl->pPV[ i ], HWND_TOP,
+                             pCtl->prclPV[ i ].xLeft, pCtl->prclPV[ i ].yBottom,
+                             lCurCX, lHeight, SWP_SIZE | SWP_MOVE | SWP_SHOW );
+            lCurX = pCtl->prclPV[ i ].xRight + 1;
+        }
+    }
+//fclose(f);
 }
 
 

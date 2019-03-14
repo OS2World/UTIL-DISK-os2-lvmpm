@@ -2,8 +2,28 @@
  ** LVMPM - utils.c                                                         **
  *****************************************************************************
  * This file contains various general-purpose utility routines.              *
+ *****************************************************************************
+ *                                                                           *
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *  This program is free software; you can redistribute it and/or modify it  *
+ *  under the terms of the GNU General Public License as published by the    *
+ *  Free Software Foundation; either version 2 of the License, or (at your   *
+ *  option) any later version.                                               *
+ *                                                                           *
+ *  This program is distributed in the hope that it will be useful, but      *
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of               *
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU        *
+ *  General Public License for more details.                                 *
+ *                                                                           *
+ *  You should have received a copy of the GNU General Public License along  *
+ *  with this program; if not, write to the Free Software Foundation, Inc.,  *
+ *  59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                  *
+ *                                                                           *
  *****************************************************************************/
+
 #include "lvmpm.h"
+
 
 /* ------------------------------------------------------------------------- *
  * CentreWindow                                                              *
@@ -48,6 +68,31 @@ void CentreWindow( HWND hwndCentre, HWND hwndRelative, ULONG flFlags )
                          x + ox, y + oy, wp.cx, wp.cy, SWP_MOVE | flFlags );
     }
 
+}
+
+/* ------------------------------------------------------------------------- *
+ * ResizeDialog                                                              *
+ *                                                                           *
+ * Adjusts the size of a dialog.                                             *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *     HWND  hwnd: The dialog to be resized                                  *
+ *     LONG  cx  : The difference in horizontal size, in dialog coordinates  *
+ *     LONG  cy  : The difference in vertical size, in dialog coordinates    *
+ *                                                                           *
+ * RETURNS: N/A                                                              *
+ * ------------------------------------------------------------------------- */
+void ResizeDialog( HWND hwnd, LONG cx, LONG cy )
+{
+    POINTL ptl;     // converted coordinate amounts
+    SWP    wp;      // window-position structure
+
+    if ( ! WinQueryWindowPos( hwnd, &wp )) return;
+    ptl.x = cx;
+    ptl.y = cy;
+    if ( ! WinMapDlgPoints( hwnd, &ptl, 1, TRUE )) return;
+    WinSetWindowPos( hwnd, HWND_TOP,
+                     wp.x, wp.y, wp.cx + ptl.x, wp.cy + ptl.y, SWP_SIZE );
 }
 
 
@@ -270,6 +315,34 @@ MRESULT EXPENTRY InsetBorderProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
 
 
 /* ------------------------------------------------------------------------- *
+ * OutlineBorderProc()                                                       *
+ *                                                                           *
+ * Subclassed window procedure for the "outline" style rectangle control.    *
+ * See OS/2 PM reference for a description of input and output.              *
+ * ------------------------------------------------------------------------- */
+MRESULT EXPENTRY OutlineBorderProc( HWND hwnd, ULONG msg, MPARAM mp1, MPARAM mp2 )
+{
+    RECTL  rcl;
+    HPS    hps;
+
+    switch( msg ) {
+        case WM_PAINT:
+            hps = WinBeginPaint( hwnd, NULLHANDLE, NULLHANDLE );
+            WinQueryWindowRect( hwnd, &rcl );
+            GpiCreateLogColorTable( hps, 0, LCOLF_RGB, 0, 0, NULL );
+            DrawOutlineBorder( hps, rcl );
+            WinEndPaint( hps );
+            return (MRESULT) 0;
+
+        default: break;
+    }
+
+    return (MRESULT) g_pfnRecProc( hwnd, msg, mp1, mp2 );
+
+}
+
+
+/* ------------------------------------------------------------------------- *
  * DrawInsetBorder()                                                         *
  *                                                                           *
  * Draws an 'inset' border around the specified rectangle.  Mostly called    *
@@ -389,7 +462,6 @@ void DrawOutlineBorder( HPS hps, RECTL rcl )
     ptl.x = rcl.xRight - 1;
     ptl.y = rcl.yTop;
     GpiBox( hps, DRO_OUTLINE, &ptl, 0, 0 );
-
 }
 
 
@@ -440,6 +512,8 @@ BOOL MenuItemAddCnd( HWND hwndMenu, SHORT sPos, SHORT sID, PSZ pszTitle, SHORT s
     MENUITEM mi;
     SHORT    rc;
 
+    if ( !hwndMenu ) return FALSE;
+
     if ( ! winhQueryMenuItem( hwndMenu, sID, TRUE, &mi )) {
         rc = winhInsertMenuItem( hwndMenu, sPos, sID,  pszTitle, sfStyle, 0 );
         if (( rc != MIT_MEMERROR ) && ( rc != MIT_ERROR ))
@@ -447,3 +521,68 @@ BOOL MenuItemAddCnd( HWND hwndMenu, SHORT sPos, SHORT sID, PSZ pszTitle, SHORT s
     }
     return FALSE;
 }
+
+
+/* ------------------------------------------------------------------------- *
+ * MenuItemEnable()                                                          *
+ *                                                                           *
+ * Enables or disables the specified menu item ID in up to two menus.        *
+ * Either of the menu handles may be NULL, indicating no menu.               *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND  hwndMenu1: Handle of the first menu                               *
+ *   HWND  hwndMenu2: Handle of the second menu                              *
+ *   SHORT sID      : ID of menu item in both menus                          *
+ *                                                                           *
+ * ------------------------------------------------------------------------- */
+void MenuItemEnable( HWND hwndMenu1, HWND hwndMenu2, SHORT sID, BOOL fEnable )
+{
+    if ( hwndMenu1 )
+        WinSendMsg( hwndMenu1, MM_SETITEMATTR, MPFROM2SHORT( sID, TRUE ),
+                    MPFROM2SHORT( MIA_DISABLED, fEnable? 0: MIA_DISABLED ));
+    if ( hwndMenu2 )
+        WinSendMsg( hwndMenu2, MM_SETITEMATTR, MPFROM2SHORT( sID, TRUE ),
+                    MPFROM2SHORT( MIA_DISABLED, fEnable? 0: MIA_DISABLED ));
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * GetSelectedPartition()                                                    *
+ *                                                                           *
+ * Queries the given disklist control for the partition which currently has  *
+ * selection emphasis.                                                       *
+ *                                                                           *
+ * ARGUMENTS:                                                                *
+ *   HWND   hwndDV   : Handle of the disklist control.                       *
+ *   PPVCTLDATA ppvd : Control data of the selected partition control (O).   *
+ *                                                                           *
+ * RETURNS: BOOL                                                             *
+ * ------------------------------------------------------------------------- */
+BOOL GetSelectedPartition( HWND hwndDV, PPVCTLDATA ppvd )
+{
+    HWND      hwndDisk = NULLHANDLE,
+              hwndPart = NULLHANDLE;
+    WNDPARAMS wndp = {0};
+    BOOL      bOK = FALSE;
+
+    if ( !ppvd || !hwndDV ) return FALSE;
+
+    // Find the currently-selected disk+partition
+    hwndDisk = (HWND) WinSendMsg( hwndDV, LLM_QUERYDISKEMPHASIS,
+                                  MPVOID, MPFROMSHORT( LDV_FS_SELECTED ));
+    if ( hwndDisk != NULLHANDLE )
+        hwndPart = (HWND) WinSendMsg( hwndDisk, LDM_QUERYPARTITIONEMPHASIS,
+                                      MPVOID, MPFROMSHORT( LPV_FS_SELECTED ));
+
+    // Now get the partition information from its control
+    if ( hwndPart != NULLHANDLE ) {
+        wndp.fsStatus  = WPM_CTLDATA;
+        wndp.cbCtlData = sizeof( PVCTLDATA );
+        wndp.pCtlData  = ppvd;
+        if ( WinSendMsg( hwndPart, WM_QUERYWINDOWPARAMS, MPFROMP( &wndp ), MPVOID ))
+            bOK = TRUE;
+    }
+    return bOK;
+}
+
+

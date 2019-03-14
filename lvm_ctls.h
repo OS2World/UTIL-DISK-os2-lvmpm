@@ -24,6 +24,23 @@
  *                                                                           *
  * This file also includes several utility functions which are used by these *
  * controls; these have public prototypes as they are generally useful.      *
+ *                                                                           *
+ *****************************************************************************
+ * Copyright (C) 2011-2019 Alexander Taylor.                                 *
+ *                                                                           *
+ *   This program is free software; you can redistribute it and/or modify it *
+ *   under the terms of the GNU General Public License as published by the   *
+ *   Free Software Foundation; either version 2 of the License, or (at your  *
+ *   option) any later version.                                              *
+ *                                                                           *
+ *   This program is distributed in the hope that it will be useful, but     *
+ *   WITHOUT ANY WARRANTY; without even the implied warranty of              *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU       *
+ *   General Public License for more details.                                *
+ *                                                                           *
+ *   You should have received a copy of the GNU General Public License along *
+ *   with this program; if not, write to the Free Software Foundation, Inc., *
+ *   59 Temple Place, Suite 330, Boston, MA  02111-1307  USA                 *
  *****************************************************************************/
 
 #define INCL_GPI
@@ -51,16 +68,6 @@
 
 
 // ----------------------------------------------------------------------------
-// MACROS
-
-// Handy message box for errors and debug messages
-/*
-#define ErrorPopup( text ) \
-    WinMessageBox( HWND_DESKTOP, HWND_DESKTOP, text, "Error", 0, MB_OK | MB_ERROR )
-*/
-
-
-// ----------------------------------------------------------------------------
 // CONSTANTS
 
 // Class names for our custom controls
@@ -85,6 +92,9 @@
 #define LDV_FS_SELECTED     0x0100  // used to draw selection cursor
 #define LDV_FS_FOCUS        0x0200  // used to draw keyboard-focus border
 #define LDV_FS_CONTEXT      0x1000  // used to indicate context-menu emphasis
+
+// Disk styles used by LDM_SETSTYLE
+#define LDS_FS_UNIFORM      0x01    // show all partitions with uniform width
 
 // Disk list styles used by LLM_SETSTYLE
 #define LLD_FS_TITLE        0x01    // show container-style list title
@@ -284,6 +294,19 @@
 
 #define LDM_QUERYPARTITIONS         (WM_USER + 107)
 
+
+// ............................................................................
+// LDM_SETSTYLE
+//  - mp1 (USHORT) : New style flags
+//  - mp2          : Unused, should be 0
+//  Returns 0.
+//
+// Changes the current style flags for the disk view control.  The new style
+// mask (in mp1) replaces the old one.
+// Currently, the only supported style flag is LDS_FS_UNIFORM
+// ............................................................................
+
+#define LDM_SETSTYLE                (WM_USER + 108)
 
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -632,7 +655,9 @@ typedef struct _PartitionView_CtlData {
     BYTE       bOS;                             // OS flag
     ULONG      ulSize;                          // partition size in MiB
     CHAR       szName[ PARTITION_NAME_SIZE+1 ]; // partition name
+    CHAR       szFS[ FILESYSTEM_NAME_SIZE+1 ];  // name of filesystem on partition (if any)
     CHAR       cLetter;                         // associated drive letter
+    BOOL       fInUse;                          // partition is in use (by a volume or BM)
     BOOL       fDisable;                        // partition is unselectable
 } PVCTLDATA, *PPVCTLDATA;
 
